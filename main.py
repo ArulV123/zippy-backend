@@ -8,7 +8,7 @@ import re
 app = FastAPI()
 
 origins = [
-    "https://ArulV123.github.io"
+    "https://arulv123.github.io"
 ]
 
 client = Groq(api_key=os.environ["GROQ_API_KEY"])
