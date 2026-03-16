@@ -88,7 +88,7 @@ def chat(req: ChatRequest):
     messages.append({"role": "user", "content": user_input})
 
     response = client.chat.completions.create(
-        model="mixtral-8x7b-32768",
+        model="llama-3.3-70b-versatile"        
         messages=messages,
         max_tokens=512,
         temperature=0.85,
