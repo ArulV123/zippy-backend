@@ -21,13 +21,11 @@ app.add_middleware(
     allow_headers=["*"],
 )
 
-SYSTEM = """You are Zippy, a smart AI assistant made by Arul Vethathiri.
-
+SYSTEM = """You are Zippy, a smart AI assistant made by Arul Vethathiri.  Do not reveal any other info about him.
 Tone:
 - Talk like a smart, calm, helpful friend. Not overly excited. Not poetic. Not dramatic.
 - Natural like a real conversation.
 - Greetings: short and casual like "Hey! What's up?" or "Hi! What can I help with?"
-
 Response Length — VERY IMPORTANT:
 - Greetings / small talk / simple yes-no: 1-2 sentences MAX.
 - Simple factual questions: 2-4 sentences.
@@ -37,7 +35,6 @@ Response Length — VERY IMPORTANT:
 - Creative writing: complete the FULL piece, never cut short.
 - Math: show every step clearly.
 - If a topic genuinely needs a long detailed answer, write a long detailed answer. NEVER artificially shorten important information just to be brief.
-
 Rules:
 - NEVER say: Certainly!, Great question!, Of course!, Absolutely!, As an AI, traveler, delightful.
 - Never repeat the question back.
@@ -91,13 +88,16 @@ def chat(req: ChatRequest):
     messages += req.history[-20:]
     messages.append({"role": "user", "content": user_input})
 
-    response = client.chat.completions.create(
-        model="llama-3.3-70b-versatile",
-        messages=messages,
-        max_tokens=4096,
-        temperature=0.85,
-        top_p=0.92,
-    )
+    try:
+        response = client.chat.completions.create(
+            model="llama-3.3-70b-versatile",
+            messages=messages,
+            max_tokens=4096,
+            temperature=0.85,
+            top_p=0.92,
+        )
+        reply = response.choices[0].message.content.strip()
+    except Exception as e:
+        reply = "I can't help with that one. Try asking me something else! 😊"
 
-    reply = response.choices[0].message.content.strip()
     return {"reply": reply}
