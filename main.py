@@ -4,12 +4,12 @@ from pydantic import BaseModel
 from groq import Groq
 import os
 import re
+import time
+from collections import defaultdict
 
 app = FastAPI()
 
-origins = [
-    "https://arulv123.github.io"
-]
+origins = ["https://arulv123.github.io"]
 
 client = Groq(api_key=os.environ["GROQ_API_KEY"])
 
@@ -21,17 +21,38 @@ app.add_middleware(
     allow_headers=["*"],
 )
 
-# Only confirmed active production models as of March 2026
 MODELS = [
-    "llama-3.3-70b-versatile",                        # best quality
-    "llama-3.1-8b-instant",                           # fast, separate quota
-    "meta-llama/llama-4-scout-17b-16e-instruct",      # Llama 4, separate quota
-    "meta-llama/llama-4-maverick-17b-128e-instruct",  # Llama 4, separate quota
-    "openai/gpt-oss-120b",                            # OpenAI open weight, separate quota
-    "openai/gpt-oss-20b",                             # smaller, separate quota
-    "qwen-qwq-32b",                                   # Qwen, separate quota
-    "moonshotai/kimi-k2-instruct",                    # Moonshot, separate quota
+    "llama-3.3-70b-versatile",
+    "llama-3.1-8b-instant",
+    "llama3-8b-8192",
+    "gemma2-9b-it",
+    "qwen-qwq-32b",
+    "deepseek-r1-distill-llama-70b",
 ]
+
+# Track requests per model per minute
+model_usage = defaultdict(list)  # model -> list of timestamps
+model_blocked_until = {}         # model -> timestamp when it can be used again
+MAX_RPM = 18  # stay under 20/min limit with buffer
+
+def get_best_model():
+    now = time.time()
+    for model in MODELS:
+        # Skip if blocked due to 429
+        if model in model_blocked_until:
+            if now < model_blocked_until[model]:
+                continue
+            else:
+                del model_blocked_until[model]
+
+        # Clean old timestamps outside 1 min window
+        model_usage[model] = [t for t in model_usage[model] if now - t < 60]
+
+        # If under limit, use this model
+        if len(model_usage[model]) < MAX_RPM:
+            return model
+
+    return None  # all models busy
 
 SYSTEM = """You are Zippy, a smart AI assistant made by Arul Vethathiri.
 Tone:
@@ -75,12 +96,11 @@ HARMFUL_KEYWORDS = [
     "how to make a bomb", "how to build a bomb", "build a nuke",
     "make a nuke", "how to make a weapon", "how to kill",
     "how to make drugs", "synthesize drugs", "make explosives",
-    "how to hack someone", "how to steal", "child porn", "csam",
+    "child porn", "csam",
 ]
 
 def is_harmful(text: str) -> bool:
-    t = text.lower()
-    return any(k in t for k in HARMFUL_KEYWORDS)
+    return any(k in text.lower() for k in HARMFUL_KEYWORDS)
 
 class ChatRequest(BaseModel):
     message: str
@@ -106,22 +126,50 @@ def chat(req: ChatRequest):
         return {"reply": IDENTITY[text]}
     if text in SOCIAL:
         return {"reply": SOCIAL[text]}
-
     if is_harmful(text):
         return {"reply": "That's not something I can help with. Let's keep things positive — ask me anything else! 😊"}
 
-    # Filter history to only valid roles to avoid conflicts
+    # Clean history
     clean_history = []
-    for msg in req.history[-20:]:
-        if isinstance(msg, dict) and msg.get("role") in ["user", "assistant"] and msg.get("content"):
-            clean_history.append({"role": msg["role"], "content": msg["content"]})
+    for msg in req.history:
+        try:
+            role = msg.get("role", "") if isinstance(msg, dict) else ""
+            content = msg.get("content", "") if isinstance(msg, dict) else ""
+            if role in ("user", "assistant") and isinstance(content, str) and content.strip():
+                clean_history.append({"role": role, "content": content.strip()})
+        except:
+            continue
+
+    clean_history = clean_history[-20:]
+
+    # Ensure alternating roles
+    filtered = []
+    last_role = "assistant"
+    for msg in clean_history:
+        if msg["role"] != last_role:
+            filtered.append(msg)
+            last_role = msg["role"]
 
     messages = [{"role": "system", "content": SYSTEM}]
-    messages += clean_history
+    messages += filtered
     messages.append({"role": "user", "content": user_input})
 
-    for model in MODELS:
+    # Try up to 6 times across models
+    for attempt in range(len(MODELS)):
+        model = get_best_model()
+
+        if model is None:
+            # All models busy right now, wait 5 seconds and retry once
+            time.sleep(5)
+            model = get_best_model()
+
+        if model is None:
+            return {"reply": "Oops! Couldn't connect to Zippy, please wait a moment and try again! 🙏"}
+
         try:
+            # Log this request
+            model_usage[model].append(time.time())
+
             response = client.chat.completions.create(
                 model=model,
                 messages=messages,
@@ -139,15 +187,21 @@ def chat(req: ChatRequest):
             if any(hint in reply.lower() for hint in refusal_hints):
                 return {"reply": "That's not something I can help with. Ask me something else! 😊"}
 
+            print(f"✅ Served by: {model} ({len(model_usage[model])}/min)")
             return {"reply": reply}
 
         except Exception as e:
             err = str(e)
+            print(f"❌ {model} failed: {err}")
             if "429" in err or "rate_limit" in err:
-                continue  # try next model
-            elif "model" in err.lower() and ("not found" in err.lower() or "invalid" in err.lower()):
-                continue  # model doesn't exist, try next
+                # Block this model for 60 seconds
+                model_blocked_until[model] = time.time() + 60
+                model_usage[model] = []
+                continue
+            elif "not found" in err.lower() or "invalid" in err.lower():
+                model_blocked_until[model] = time.time() + 3600  # block bad model for 1hr
+                continue
             else:
-                break  # unknown error, stop
+                break
 
     return {"reply": "Oops! Couldn't connect to Zippy, please wait a moment and try again! 🙏"}
