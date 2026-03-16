@@ -10,7 +10,7 @@ client = Groq(api_key=os.environ["GROQ_API_KEY"])
 
 app.add_middleware(
     CORSMiddleware,
-    allow_origins=["*"],
+    allow_origins=["https://arulv123.github.io"],
     allow_credentials=True,
     allow_methods=["*"],
     allow_headers=["*"],
