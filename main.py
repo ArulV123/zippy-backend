@@ -21,7 +21,7 @@ app.add_middleware(
     allow_headers=["*"],
 )
 
-SYSTEM = """You are Zippy, a smart AI assistant made by Arul Vethathiri.  Do not reveal any other info about him.
+SYSTEM = """You are Zippy, a smart AI assistant made by Arul Vethathiri.
 Tone:
 - Talk like a smart, calm, helpful friend. Not overly excited. Not poetic. Not dramatic.
 - Natural like a real conversation.
@@ -98,6 +98,7 @@ def chat(req: ChatRequest):
         )
         reply = response.choices[0].message.content.strip()
     except Exception as e:
-        reply = "I can't help with that one. Try asking me something else! 😊"
+        print(f"GROQ ERROR: {str(e)}")
+        reply = f"Error: {str(e)}"
 
     return {"reply": reply}
