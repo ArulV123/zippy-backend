@@ -6,11 +6,17 @@ import os
 import re
 
 app = FastAPI()
+
+origins = [
+    "https://ArulV123.github.io"
+]
+
 client = Groq(api_key=os.environ["GROQ_API_KEY"])
+
 
 app.add_middleware(
     CORSMiddleware,
-    allow_origins=["https://ArulV123.github.io"],
+    allow_origins=origins,
     allow_credentials=True,
     allow_methods=["*"],
     allow_headers=["*"],
