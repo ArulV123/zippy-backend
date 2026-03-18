@@ -1,3 +1,4 @@
+# main.py - Full Zippy backend (Pollinations primary, HF fallbacks, image analysis, AI-driven image generation)
 from fastapi import FastAPI, HTTPException
 from fastapi.middleware.cors import CORSMiddleware
 from pydantic import BaseModel
@@ -74,39 +75,6 @@ SYSTEM = """You are Zippy, a smart AI assistant.
 - Image analysis (when users upload images)
 - Web search for current information
 - Coding, math, explanations, creative tasks
-
-**When to Search the Web (CRITICAL):**
-You MUST search for:
-- Current events, news, recent happenings
-- Stock prices, sports scores, weather
-- Information that changes over time (who holds a position, what's currently happening, latest releases)
-- Facts you're uncertain about
-- Recent developments in any field
-- When the user asks "what's happening", "latest", "current", "recent", "now", "today"
-
-NEVER ask the user to search themselves. If you need current info, YOU search.
-
-**Tone:**
-- Smart, calm, helpful friend
-- Natural and conversational
-- Short greetings: "Hey! What's up?" or "Hi!"
-
-**Response Length:**
-- Greetings: 1-2 sentences
-- Simple questions: 2-4 sentences
-- Explanations: thorough with bullet points
-- Code: COMPLETE working code
-- Math: show all steps
-
-**Rules:**
-- NEVER say: "Certainly!", "Great question!", "Of course!", "Absolutely!", "As an AI"
-- Only mention your creator when directly asked
-- Don't ask the user for information you can search for
-- Always end with 1 emoji
-
-**Image Features:**
-- You CAN generate images (tell users this when relevant)
-- You CAN analyze uploaded images (tell users this when relevant)
 """
 
 IDENTITY = {
@@ -114,7 +82,6 @@ IDENTITY = {
     "what are you":      "I'm Zippy, an AI assistant. 🤖",
     "who made you":      "I was made by Arul Vethathiri. 👨‍💻",
     "who created you":   "I was created by Arul Vethathiri. 👨‍💻",
-    "who built you":     "I was built by Arul Vethathiri. 👨‍💻",
     "what is your name": "My name is Zippy! 😊",
     "are you an ai":     "Yes! I'm Zippy, an AI assistant. 🤖",
     "are you human":     "Nope! I'm an AI but great at conversation! 😄",
@@ -195,7 +162,7 @@ async def analyze_image(req: ImageAnalysisRequest):
     try:
         image_data = req.image or ""
         if "," in image_data:
-            image_data = image_data.split(",")[1]
+            image_data = image_data.split(",", 1)[1]
 
         try:
             image_bytes = base64.b64decode(image_data)
@@ -217,7 +184,6 @@ async def analyze_image(req: ImageAnalysisRequest):
                 api_url = f"https://api-inference.huggingface.co/models/{model_name}"
                 print(f"Trying {model_name} for analysis...")
                 try:
-                    # Post binary image; ask HF to wait for model
                     resp = await client.post(
                         api_url,
                         headers={**hf_headers, "Content-Type": "application/octet-stream"},
@@ -234,7 +200,6 @@ async def analyze_image(req: ImageAnalysisRequest):
 
                 if resp.status_code == 200:
                     ctype = resp.headers.get("content-type", "")
-                    # JSON response with text
                     if "application/json" in ctype:
                         try:
                             data = resp.json()
@@ -242,13 +207,11 @@ async def analyze_image(req: ImageAnalysisRequest):
                             data = None
                         description = None
                         if isinstance(data, list) and len(data) > 0 and isinstance(data[0], dict):
-                            # sometimes list[{"generated_text": "..."}]
                             if "generated_text" in data[0]:
                                 description = data[0]["generated_text"]
                         elif isinstance(data, dict):
                             if "generated_text" in data:
                                 description = data["generated_text"]
-                            # some HF caption models return {"caption": "..."} or "result" etc.
                             if not description:
                                 for key in ("caption", "result", "description", "text"):
                                     if key in data and isinstance(data[key], str):
@@ -259,13 +222,11 @@ async def analyze_image(req: ImageAnalysisRequest):
                             print(f"✅ Image analyzed by {model_name}: {description}")
                             return {"description": description, "response": f"I can see: {description}", "success": True}
                         else:
-                            # fallback: try parse text body
                             text = resp.text.strip()
                             if text:
                                 print(f"⚠️ Parsed text fallback from {model_name}")
                                 return {"description": text[:4000], "response": f"I can see: {text[:4000]}", "success": True}
                     else:
-                        # If the model returned image or bytes (rare for captioning) — decode and attempt call to text model (skip)
                         text = resp.text.strip()
                         if text:
                             return {"description": text[:4000], "response": f"I can see: {text[:4000]}", "success": True}
@@ -277,7 +238,6 @@ async def analyze_image(req: ImageAnalysisRequest):
                     print(f"{model_name} returned {resp.status_code}: {resp.text[:300]}")
                     continue
 
-        # All failed
         error_msg = "Image analysis is warming up or unavailable. Try again in a few seconds."
         return {"description": error_msg, "response": error_msg, "success": False}
 
@@ -378,6 +338,35 @@ def chat(req: ChatRequest):
                 return {"reply": "That's not something I can help with. Ask me something else! 😊"}
 
             print(f"✅ Served by: {model}")
+
+            # Decide whether to auto-generate an image (AI decides)
+            try:
+                # Ask the LLM (via groq client) a tiny yes/no question
+                should_msg = [
+                    {"role": "system", "content": "Answer with just YES or NO. Does the user's request require generating a new illustrative image?"},
+                    {"role": "user", "content": user_input}
+                ]
+                sg_resp = client.chat.completions.create(
+                    model=model,
+                    messages=should_msg,
+                    max_tokens=5,
+                    temperature=0.0
+                )
+                sg_text = sg_resp.choices[0].message.content.strip().lower()
+                wants_image = "yes" in sg_text
+            except Exception as e:
+                print("image-decision step failed:", e)
+                wants_image = False
+
+            if wants_image:
+                # call internal async image generator from sync endpoint
+                try:
+                    generated = asyncio.run(generate_image_internal(user_input))
+                    if generated and generated.get("success"):
+                        return {"reply": reply, "image": generated.get("imageUrl")}
+                except Exception as e:
+                    print("image generation from chat failed:", e)
+
             return {"reply": reply}
 
         except Exception as e:
@@ -398,17 +387,18 @@ def chat(req: ChatRequest):
 # ----------------------------------------------------------------------
 # IMAGE GENERATION - Pollinations primary, HF fallbacks (async, robust)
 # ----------------------------------------------------------------------
-@app.post("/generate-image")
-async def generate_image(body: ImageRequest):
-    prompt = (body.prompt or "").strip()
-    if not prompt:
-        raise HTTPException(status_code=400, detail="prompt required")
+async def generate_image_internal(prompt: str):
+    """
+    Internal helper that tries Pollinations first, then Hugging Face models.
+    Returns dict: {"success": bool, "imageUrl": str, "service": str, "error": str (optional)}
+    """
+    if not prompt or not prompt.strip():
+        return {"success": False, "imageUrl": "", "service": "none", "error": "empty prompt"}
 
-    print(f"🎨 Generating: {prompt[:120]}...")
+    prompt = prompt.strip()
     encoded_prompt = quote(prompt)
     seed = random.randint(1, 999999)
 
-    # Use httpx async client
     hf_headers = {}
     if HUGGINGFACE_API_KEY:
         hf_headers["Authorization"] = f"Bearer {HUGGINGFACE_API_KEY}"
@@ -453,25 +443,19 @@ async def generate_image(body: ImageRequest):
 
             if resp.status_code == 200:
                 ctype = resp.headers.get("content-type", "")
-                # If binary image bytes returned
-                if "image" in ctype or "application/octet-stream" in ctype or resp.content:
-                    if len(resp.content) > 100:
-                        return resp.content
-                # If JSON returned, maybe base64 inside
+                if "image" in ctype or "application/octet-stream" in ctype or (resp.content and len(resp.content) > 100):
+                    return resp.content
                 if "application/json" in ctype:
                     try:
                         data = resp.json()
                     except Exception:
                         data = None
-                    # common keys that may hold base64 image
                     for key in ("image", "image_base64", "b64_json", "base64", "generated_image"):
                         if isinstance(data, dict) and key in data and isinstance(data[key], str) and len(data[key]) > 100:
                             try:
                                 return base64.b64decode(data[key])
                             except Exception:
                                 pass
-                    # some models return bytes in returned JSON arrays (rare); skip
-                # fallback: if resp.content present and >100 bytes use it
                 if resp.content and len(resp.content) > 100:
                     return resp.content
                 return None
@@ -514,3 +498,20 @@ async def generate_image(body: ImageRequest):
 
     # All services failed
     return {"imageUrl": "", "service": "none", "success": False, "error": "All image services failed or are warming up."}
+
+@app.post("/generate-image")
+async def generate_image(body: ImageRequest):
+    """
+    Public endpoint to generate image from a prompt.
+    Uses the shared generate_image_internal helper.
+    """
+    prompt = (body.prompt or "").strip()
+    if not prompt:
+        raise HTTPException(status_code=400, detail="prompt required")
+
+    result = await generate_image_internal(prompt)
+    return result
+
+# ----------------------------------------------------------------------
+# End of file
+# ----------------------------------------------------------------------
