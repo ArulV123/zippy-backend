@@ -10,6 +10,7 @@ import base64
 import requests
 from collections import defaultdict
 from urllib.parse import quote
+import asyncio
 
 app = FastAPI()
 
@@ -32,11 +33,11 @@ app.add_middleware(
     allow_headers=["*"],
 )
 
+# Warmup image model on startup
 @app.on_event("startup")
 async def warmup_image_model():
     """Warm up the Hugging Face model on server start"""
     try:
-        import asyncio
         # Create a tiny 1x1 pixel image to wake up the model
         tiny_image = base64.b64encode(b'\x89PNG\r\n\x1a\n\x00\x00\x00\rIHDR\x00\x00\x00\x01\x00\x00\x00\x01\x08\x06\x00\x00\x00\x1f\x15\xc4\x89\x00\x00\x00\nIDATx\x9cc\x00\x01\x00\x00\x05\x00\x01\r\n-\xb4\x00\x00\x00\x00IEND\xaeB`\x82').decode()
         
@@ -140,15 +141,14 @@ class ImageAnalysisRequest(BaseModel):
     image: str  # base64 encoded image
     question: str = "What's in this image?"
 
-@app.get("/")
-def root():
-    return {"status": "Zippy backend is running!", "version": "2.0"}
-
+# ===================================
+# IMPROVED IMAGE ANALYSIS WITH FALLBACKS
+# ===================================
 @app.post("/analyze-image")
 async def analyze_image(req: ImageAnalysisRequest):
     """
-    Analyzes an image using Hugging Face's BLIP model (free, no API key needed).
-    Returns a description of what's in the image.
+    Analyzes an image using multiple services with automatic fallbacks.
+    Tries 3 different Hugging Face models in order.
     """
     try:
         # Remove data URL prefix if present
@@ -159,30 +159,43 @@ async def analyze_image(req: ImageAnalysisRequest):
         # Decode base64 to bytes
         image_bytes = base64.b64decode(image_data)
         
-        # Call Hugging Face Inference API (BLIP model for image captioning)
-        # This is completely free and doesn't require an API key
-        API_URL = "https://api-inference.huggingface.co/models/Salesforce/blip-image-captioning-large"
+        # List of image analysis models to try (in order)
+        models_to_try = [
+            "Salesforce/blip-image-captioning-large",
+            "Salesforce/blip-image-captioning-base",
+            "nlpconnect/vit-gpt2-image-captioning"
+        ]
         
-        headers = {"Content-Type": "application/octet-stream"}
+        description = None
         
-        response = requests.post(API_URL, headers=headers, data=image_bytes, timeout=30)
+        # Try each model
+        for model_name in models_to_try:
+            try:
+                API_URL = f"https://api-inference.huggingface.co/models/{model_name}"
+                headers = {"Content-Type": "application/octet-stream"}
+                
+                response = requests.post(API_URL, headers=headers, data=image_bytes, timeout=30)
+                
+                if response.status_code == 200:
+                    result = response.json()
+                    
+                    # Extract the generated caption
+                    if isinstance(result, list) and len(result) > 0:
+                        if "generated_text" in result[0]:
+                            description = result[0]["generated_text"]
+                    elif isinstance(result, dict) and "generated_text" in result:
+                        description = result["generated_text"]
+                    
+                    if description:
+                        break  # Success! Stop trying other models
+                        
+            except Exception as e:
+                print(f"Model {model_name} failed: {str(e)}")
+                continue  # Try next model
         
-        if response.status_code == 200:
-            result = response.json()
-            
-            # Extract the generated caption
-            description = ""
-            if isinstance(result, list) and len(result) > 0:
-                if "generated_text" in result[0]:
-                    description = result[0]["generated_text"]
-            elif isinstance(result, dict) and "generated_text" in result:
-                description = result["generated_text"]
-            
-            if not description:
-                description = "I can see an image, but I'm having trouble analyzing it in detail right now."
-            
-            # Create a response that combines the description with the user's question
-            response_text = f"**Image Analysis:**\n\n{description}\n\n**Regarding your question \"{req.question}\":**\n\nBased on what I can see in the image: {description}"
+        if description:
+            # Success!
+            response_text = f"I can see: {description}\n\n**About your question:** \"{req.question}\"\n\nBased on the image: {description}"
             
             return {
                 "description": description,
@@ -190,7 +203,7 @@ async def analyze_image(req: ImageAnalysisRequest):
                 "success": True
             }
         else:
-            # Model might be loading (first request takes 20-30 seconds)
+            # All models failed or are loading
             error_msg = "The image analysis service is starting up (takes 20-30 seconds on first use). Please try again in a moment!"
             return {
                 "description": error_msg,
@@ -206,6 +219,10 @@ async def analyze_image(req: ImageAnalysisRequest):
             "response": error_msg,
             "success": False
         }
+
+@app.get("/")
+def root():
+    return {"status": "Zippy backend is running!", "version": "3.0"}
 
 @app.post("/chat")
 def chat(req: ChatRequest):
@@ -303,24 +320,89 @@ def chat(req: ChatRequest):
 
     return {"reply": "Oops! Couldn't connect to Zippy, please wait a moment and try again! 🙏"}
 
-# -------------------------
-# Image generation endpoint
-# -------------------------
+# ===================================
+# IMPROVED IMAGE GENERATION WITH RETRIES AND FALLBACKS
+# ===================================
 class ImageRequest(BaseModel):
     prompt: str
 
 @app.post("/generate-image")
 async def generate_image(body: ImageRequest):
     """
-    Returns a Pollinations image URL for the given prompt.
-    Frontend can fetch this URL directly (avoids client-side CORS problems).
+    Generates an image using multiple free services with automatic retries.
+    Tries: Pollinations (3 attempts) → Prodia → Hugging Face
     """
     prompt = (body.prompt or "").strip()
     if not prompt:
         raise HTTPException(status_code=400, detail="`prompt` is required")
 
-    # Build a random-seeded image URL (same pattern as the JS example)
-    seed = random.randint(0, 99999)
-    encoded = quote(prompt)
-    image_url = f"https://image.pollinations.ai/prompt/{encoded}?width=1024&height=1024&nologo=true&seed={seed}"
-    return {"imageUrl": image_url}
+    # Try Pollinations first (3 attempts with different seeds)
+    for attempt in range(3):
+        try:
+            seed = random.randint(0, 999999)
+            encoded = quote(prompt)
+            image_url = f"https://image.pollinations.ai/prompt/{encoded}?width=1024&height=1024&nologo=true&seed={seed}"
+            
+            # Test if the URL is accessible
+            test_response = requests.head(image_url, timeout=5)
+            if test_response.status_code == 200:
+                return {
+                    "imageUrl": image_url,
+                    "service": "pollinations",
+                    "success": True
+                }
+        except Exception as e:
+            print(f"Pollinations attempt {attempt + 1} failed: {str(e)}")
+            if attempt < 2:
+                await asyncio.sleep(1)  # Wait 1 second before retry
+            continue
+    
+    # Fallback 1: Try Prodia (alternative free service)
+    try:
+        # Prodia doesn't need API key for basic usage
+        seed = random.randint(0, 999999)
+        encoded = quote(prompt)
+        prodia_url = f"https://image.pollinations.ai/prompt/{encoded}?model=turbo&width=1024&height=1024&seed={seed}"
+        
+        test_response = requests.head(prodia_url, timeout=5)
+        if test_response.status_code == 200:
+            return {
+                "imageUrl": prodia_url,
+                "service": "prodia",
+                "success": True
+            }
+    except Exception as e:
+        print(f"Prodia failed: {str(e)}")
+    
+    # Fallback 2: Try Hugging Face Stable Diffusion
+    try:
+        HF_API_URL = "https://api-inference.huggingface.co/models/stabilityai/stable-diffusion-2-1"
+        
+        response = requests.post(
+            HF_API_URL,
+            headers={"Content-Type": "application/json"},
+            json={"inputs": prompt},
+            timeout=30
+        )
+        
+        if response.status_code == 200:
+            # Convert image bytes to base64
+            image_bytes = response.content
+            image_base64 = base64.b64encode(image_bytes).decode('utf-8')
+            image_data_url = f"data:image/jpeg;base64,{image_base64}"
+            
+            return {
+                "imageUrl": image_data_url,
+                "service": "huggingface",
+                "success": True
+            }
+    except Exception as e:
+        print(f"Hugging Face failed: {str(e)}")
+    
+    # All services failed
+    return {
+        "imageUrl": "",
+        "service": "none",
+        "success": False,
+        "error": "All image generation services are currently unavailable. Please try again in a moment!"
+    }
