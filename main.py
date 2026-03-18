@@ -32,6 +32,25 @@ app.add_middleware(
     allow_headers=["*"],
 )
 
+@app.on_event("startup")
+async def warmup_image_model():
+    """Warm up the Hugging Face model on server start"""
+    try:
+        import asyncio
+        # Create a tiny 1x1 pixel image to wake up the model
+        tiny_image = base64.b64encode(b'\x89PNG\r\n\x1a\n\x00\x00\x00\rIHDR\x00\x00\x00\x01\x00\x00\x00\x01\x08\x06\x00\x00\x00\x1f\x15\xc4\x89\x00\x00\x00\nIDATx\x9cc\x00\x01\x00\x00\x05\x00\x01\r\n-\xb4\x00\x00\x00\x00IEND\xaeB`\x82').decode()
+        
+        API_URL = "https://api-inference.huggingface.co/models/Salesforce/blip-image-captioning-large"
+        await asyncio.to_thread(
+            requests.post, API_URL, 
+            headers={"Content-Type": "application/octet-stream"},
+            data=base64.b64decode(tiny_image),
+            timeout=30
+        )
+        print("✅ Image model warmed up")
+    except:
+        print("⚠️ Model warmup failed (will work on first real use)")
+
 MODELS = [
     "llama-3.3-70b-versatile",
     "llama-3.1-8b-instant",
