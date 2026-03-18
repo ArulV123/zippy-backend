@@ -70,33 +70,51 @@ def get_best_model():
             return model
     return None
 
-SYSTEM = """You are Zippy, a smart AI assistant made by Arul Vethathiri.
-Tone:
-- Talk like a smart, calm, helpful friend. Not overly excited. Not poetic. Not dramatic.
-- Natural like a real conversation.
+# IMPROVED SYSTEM PROMPT - No unnecessary name mentions, knows about image capabilities
+SYSTEM = """You are Zippy, a smart AI assistant.
+
+**Your Capabilities:**
+- You can generate images when users ask (e.g., "generate image of...", "create image of...", "draw me...")
+- You can analyze images that users upload
+- You have web search to find current information when needed
+- You're great at coding, math, explanations, and creative tasks
+
+**Tone:**
+- Talk like a smart, calm, helpful friend
+- Natural and conversational
+- Not overly excited, poetic, or dramatic
 - Greetings: short and casual like "Hey! What's up?" or "Hi! What can I help with?"
-Response Length — VERY IMPORTANT:
-- Greetings / small talk / simple yes-no: 1-2 sentences MAX.
-- Simple factual questions: 2-4 sentences.
-- Explanations and how-things-work: use bullet points, be thorough, cover ALL important points fully.
-- Code requests: give the COMPLETE working code, never cut it short, never truncate.
-- Comparisons and lists: be comprehensive, use tables or bullets.
-- Creative writing: complete the FULL piece, never cut short.
-- Math: show every step clearly.
-- If a topic genuinely needs a long detailed answer, write a long detailed answer. NEVER artificially shorten important information just to be brief.
-Rules:
-- NEVER say: Certainly!, Great question!, Of course!, Absolutely!, As an AI, traveler, delightful.
-- Never repeat the question back.
-- Always end with 1 relevant emoji."""
+
+**Response Length:**
+- Greetings/small talk: 1-2 sentences MAX
+- Simple questions: 2-4 sentences
+- Explanations: thorough with bullet points covering ALL important points
+- Code: COMPLETE working code, never truncated
+- Comparisons/lists: comprehensive, use tables or bullets
+- Creative writing: FULL piece, never cut short
+- Math: show every step clearly
+
+**Important Rules:**
+- NEVER say: "Certainly!", "Great question!", "Of course!", "Absolutely!", "As an AI", "traveler", "delightful"
+- Never repeat the question back
+- Only mention your creator (Arul Vethathiri) if directly asked "who made you" or similar
+- Don't unnecessarily mention your creator in normal conversation
+- Always end with 1 relevant emoji
+
+**When to Use Your Capabilities:**
+- Image generation: When user asks to generate/create/draw an image
+- Image analysis: When user uploads an image
+- Web search: When you need current info, recent events, or verification of facts you're uncertain about
+"""
 
 IDENTITY = {
-    "who are you":       "I'm Zippy, a powerful AI chatbot made by Arul Vethathiri! 🤖",
-    "what are you":      "I'm Zippy, an AI made by Arul Vethathiri. 🤖",
+    "who are you":       "I'm Zippy, a smart AI assistant! 🤖",
+    "what are you":      "I'm Zippy, an AI assistant. 🤖",
     "who made you":      "I was made by Arul Vethathiri. 👨‍💻",
     "who created you":   "I was created by Arul Vethathiri. 👨‍💻",
     "who built you":     "I was built by Arul Vethathiri. 👨‍💻",
     "what is your name": "My name is Zippy! 😊",
-    "are you an ai":     "Yes! I'm Zippy, an AI made by Arul Vethathiri. 🤖",
+    "are you an ai":     "Yes! I'm Zippy, an AI assistant. 🤖",
     "are you human":     "Nope! I'm Zippy — an AI but great at conversation! 😄",
 }
 
@@ -128,6 +146,7 @@ class ImageAnalysisRequest(BaseModel):
 
 @app.post("/analyze-image")
 async def analyze_image(req: ImageAnalysisRequest):
+    """Analyzes images using Hugging Face BLIP models with fallbacks"""
     try:
         image_data = req.image
         if "," in image_data:
@@ -160,6 +179,7 @@ async def analyze_image(req: ImageAnalysisRequest):
                         description = result["generated_text"]
                     
                     if description:
+                        print(f"✅ Image analyzed with {model_name}")
                         break
                         
             except Exception as e:
@@ -167,7 +187,7 @@ async def analyze_image(req: ImageAnalysisRequest):
                 continue
         
         if description:
-            response_text = f"I can see: {description}\n\n**About your question:** \"{req.question}\"\n\nBased on the image: {description}"
+            response_text = f"I can see: {description}\n\nRegarding your question \"{req.question}\" - based on the image, {description}"
             
             return {
                 "description": description,
@@ -175,7 +195,7 @@ async def analyze_image(req: ImageAnalysisRequest):
                 "success": True
             }
         else:
-            error_msg = "The image analysis service is starting up (takes 20-30 seconds on first use). Please try again in a moment!"
+            error_msg = "The image analysis service is warming up (takes 20-30 seconds on first use). Please try again in a moment!"
             return {
                 "description": error_msg,
                 "response": error_msg,
@@ -184,7 +204,7 @@ async def analyze_image(req: ImageAnalysisRequest):
             
     except Exception as e:
         print(f"Image analysis error: {str(e)}")
-        error_msg = f"I can see you've uploaded an image, but I'm having trouble analyzing it right now. Please try again!"
+        error_msg = "I'm having trouble analyzing this image right now. Please try again!"
         return {
             "description": error_msg,
             "response": error_msg,
@@ -193,7 +213,7 @@ async def analyze_image(req: ImageAnalysisRequest):
 
 @app.get("/")
 def root():
-    return {"status": "Zippy backend is running!", "version": "3.2"}
+    return {"status": "Zippy backend is running!", "version": "4.0"}
 
 @app.post("/chat")
 def chat(req: ChatRequest):
@@ -245,7 +265,7 @@ def chat(req: ChatRequest):
             model = get_best_model()
 
         if model is None:
-            return {"reply": "Oops! Couldn't connect to Zippy, please wait a moment and try again! 🙏"}
+            return {"reply": "Oops! Couldn't connect right now, please try again in a moment! 🙏"}
 
         try:
             model_usage[model].append(time.time())
@@ -283,10 +303,10 @@ def chat(req: ChatRequest):
             else:
                 break
 
-    return {"reply": "Oops! Couldn't connect to Zippy, please wait a moment and try again! 🙏"}
+    return {"reply": "Oops! Couldn't connect right now, please try again in a moment! 🙏"}
 
 # ===================================
-# IMAGE GENERATION - MULTIPLE WORKING SERVICES
+# IMAGE GENERATION - FIXED TO ACTUALLY WORK
 # ===================================
 class ImageRequest(BaseModel):
     prompt: str
@@ -294,18 +314,18 @@ class ImageRequest(BaseModel):
 @app.post("/generate-image")
 async def generate_image(body: ImageRequest):
     """
-    Tries multiple free image generation services in order:
-    1. Hugging Face Stable Diffusion (most reliable)
-    2. Pollinations (fallback)
-    3. Fal.ai (fallback)
+    Generates images using Hugging Face Stable Diffusion.
+    Returns actual image data as base64, not URLs that can fail.
     """
     prompt = (body.prompt or "").strip()
     if not prompt:
         raise HTTPException(status_code=400, detail="`prompt` is required")
 
-    # Try Hugging Face Stable Diffusion first (most reliable)
     try:
+        # Use Hugging Face Stable Diffusion
         HF_API_URL = "https://api-inference.huggingface.co/models/stabilityai/stable-diffusion-2-1"
+        
+        print(f"🎨 Generating image: {prompt[:50]}...")
         
         response = requests.post(
             HF_API_URL,
@@ -317,48 +337,31 @@ async def generate_image(body: ImageRequest):
         if response.status_code == 200 and response.content:
             # Convert to base64
             image_base64 = base64.b64encode(response.content).decode('utf-8')
-            image_data_url = f"data:image/jpeg;base64,{image_base64}"
+            image_data_url = f"data:image/png;base64,{image_base64}"
+            
+            print(f"✅ Image generated successfully!")
             
             return {
                 "imageUrl": image_data_url,
                 "service": "huggingface",
                 "success": True
             }
+        elif response.status_code == 503:
+            # Model is loading
+            return {
+                "imageUrl": "",
+                "service": "huggingface",
+                "success": False,
+                "error": "The image generation model is warming up (takes 20-30 seconds on first use). Please try again in a moment!"
+            }
+        else:
+            raise Exception(f"HuggingFace returned {response.status_code}")
+            
     except Exception as e:
-        print(f"HuggingFace failed: {str(e)}")
-    
-    # Fallback: Try Pollinations
-    try:
-        seed = random.randint(0, 999999)
-        encoded = quote(prompt)
-        pollinations_url = f"https://image.pollinations.ai/prompt/{encoded}?width=1024&height=1024&nologo=true&seed={seed}"
-        
+        print(f"Image generation error: {str(e)}")
         return {
-            "imageUrl": pollinations_url,
-            "service": "pollinations",
-            "success": True
+            "imageUrl": "",
+            "service": "none",
+            "success": False,
+            "error": "Image generation is temporarily unavailable. Please try again in a moment!"
         }
-    except Exception as e:
-        print(f"Pollinations failed: {str(e)}")
-    
-    # Last resort: Fal.ai
-    try:
-        seed = random.randint(0, 999999)
-        encoded = quote(prompt)
-        fal_url = f"https://fal.run/fal-ai/fast-sdxl/generate?prompt={encoded}&seed={seed}"
-        
-        return {
-            "imageUrl": fal_url,
-            "service": "fal",
-            "success": True
-        }
-    except Exception as e:
-        print(f"Fal.ai failed: {str(e)}")
-    
-    # All failed
-    return {
-        "imageUrl": "",
-        "service": "none",
-        "success": False,
-        "error": "All image generation services are currently unavailable. Please try again in a moment!"
-    }
