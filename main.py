@@ -29,22 +29,18 @@ async def lifespan(app: FastAPI):
     except:
         print("⚠️ Model warmup failed (will work on first real use)")
     
-    yield  # Server is running
-    
-    # Shutdown (cleanup if needed)
+    yield
     print("🔴 Server shutting down")
 
 app = FastAPI(lifespan=lifespan)
 
-# Allowed origins (your frontend)
 origins = [
     "https://arulv123.github.io",
     "http://localhost:8000",
     "http://127.0.0.1:8000",
-    "*"  # Allow all for testing, remove in production
+    "*"
 ]
 
-# GROQ client (make sure GROQ_API_KEY is set in environment)
 client = Groq(api_key=os.environ.get("GROQ_API_KEY", ""))
 
 app.add_middleware(
@@ -64,29 +60,22 @@ MODELS = [
     "deepseek-r1-distill-llama-70b",
 ]
 
-# Track requests per model per minute
-model_usage = defaultdict(list)  # model -> list of timestamps
-model_blocked_until = {}         # model -> timestamp when it can be used again
-MAX_RPM = 18  # stay under 20/min limit with buffer
+model_usage = defaultdict(list)
+model_blocked_until = {}
+MAX_RPM = 18
 
 def get_best_model():
     now = time.time()
     for model in MODELS:
-        # Skip if blocked due to 429 or invalid
         if model in model_blocked_until:
             if now < model_blocked_until[model]:
                 continue
             else:
                 del model_blocked_until[model]
-
-        # Clean old timestamps outside 1 min window
         model_usage[model] = [t for t in model_usage[model] if now - t < 60]
-
-        # If under limit, use this model
         if len(model_usage[model]) < MAX_RPM:
             return model
-
-    return None  # all models busy
+    return None
 
 SYSTEM = """You are Zippy, a smart AI assistant made by Arul Vethathiri.
 Tone:
@@ -141,28 +130,18 @@ class ChatRequest(BaseModel):
     history: list = []
 
 class ImageAnalysisRequest(BaseModel):
-    image: str  # base64 encoded image
+    image: str
     question: str = "What's in this image?"
 
-# ===================================
-# IMPROVED IMAGE ANALYSIS WITH FALLBACKS
-# ===================================
 @app.post("/analyze-image")
 async def analyze_image(req: ImageAnalysisRequest):
-    """
-    Analyzes an image using multiple services with automatic fallbacks.
-    Tries 3 different Hugging Face models in order.
-    """
     try:
-        # Remove data URL prefix if present
         image_data = req.image
         if "," in image_data:
             image_data = image_data.split(",")[1]
         
-        # Decode base64 to bytes
         image_bytes = base64.b64decode(image_data)
         
-        # List of image analysis models to try (in order)
         models_to_try = [
             "Salesforce/blip-image-captioning-large",
             "Salesforce/blip-image-captioning-base",
@@ -171,7 +150,6 @@ async def analyze_image(req: ImageAnalysisRequest):
         
         description = None
         
-        # Try each model
         for model_name in models_to_try:
             try:
                 API_URL = f"https://api-inference.huggingface.co/models/{model_name}"
@@ -182,7 +160,6 @@ async def analyze_image(req: ImageAnalysisRequest):
                 if response.status_code == 200:
                     result = response.json()
                     
-                    # Extract the generated caption
                     if isinstance(result, list) and len(result) > 0:
                         if "generated_text" in result[0]:
                             description = result[0]["generated_text"]
@@ -190,14 +167,13 @@ async def analyze_image(req: ImageAnalysisRequest):
                         description = result["generated_text"]
                     
                     if description:
-                        break  # Success! Stop trying other models
+                        break
                         
             except Exception as e:
                 print(f"Model {model_name} failed: {str(e)}")
-                continue  # Try next model
+                continue
         
         if description:
-            # Success!
             response_text = f"I can see: {description}\n\n**About your question:** \"{req.question}\"\n\nBased on the image: {description}"
             
             return {
@@ -206,7 +182,6 @@ async def analyze_image(req: ImageAnalysisRequest):
                 "success": True
             }
         else:
-            # All models failed or are loading
             error_msg = "The image analysis service is starting up (takes 20-30 seconds on first use). Please try again in a moment!"
             return {
                 "description": error_msg,
@@ -225,7 +200,7 @@ async def analyze_image(req: ImageAnalysisRequest):
 
 @app.get("/")
 def root():
-    return {"status": "Zippy backend is running!", "version": "3.0"}
+    return {"status": "Zippy backend is running!", "version": "3.1"}
 
 @app.post("/chat")
 def chat(req: ChatRequest):
@@ -246,7 +221,6 @@ def chat(req: ChatRequest):
     if is_harmful(text):
         return {"reply": "That's not something I can help with. Let's keep things positive — ask me anything else! 😊"}
 
-    # Clean history
     clean_history = []
     for msg in req.history:
         try:
@@ -259,7 +233,6 @@ def chat(req: ChatRequest):
 
     clean_history = clean_history[-20:]
 
-    # Ensure alternating roles
     filtered = []
     last_role = "assistant"
     for msg in clean_history:
@@ -271,12 +244,10 @@ def chat(req: ChatRequest):
     messages += filtered
     messages.append({"role": "user", "content": user_input})
 
-    # Try up to len(MODELS) times across models
     for attempt in range(len(MODELS)):
         model = get_best_model()
 
         if model is None:
-            # All models busy right now, brief pause then retry
             time.sleep(5)
             model = get_best_model()
 
@@ -284,7 +255,6 @@ def chat(req: ChatRequest):
             return {"reply": "Oops! Couldn't connect to Zippy, please wait a moment and try again! 🙏"}
 
         try:
-            # Log this request
             model_usage[model].append(time.time())
 
             response = client.chat.completions.create(
@@ -311,12 +281,11 @@ def chat(req: ChatRequest):
             err = str(e)
             print(f"❌ {model} failed: {err}")
             if "429" in err or "rate_limit" in err:
-                # Block this model for 60 seconds
                 model_blocked_until[model] = time.time() + 60
                 model_usage[model] = []
                 continue
             elif "not found" in err.lower() or "invalid" in err.lower():
-                model_blocked_until[model] = time.time() + 3600  # block bad model for 1hr
+                model_blocked_until[model] = time.time() + 3600
                 continue
             else:
                 break
@@ -324,7 +293,7 @@ def chat(req: ChatRequest):
     return {"reply": "Oops! Couldn't connect to Zippy, please wait a moment and try again! 🙏"}
 
 # ===================================
-# IMPROVED IMAGE GENERATION WITH RETRIES AND FALLBACKS
+# SIMPLIFIED IMAGE GENERATION - NO URL TESTING
 # ===================================
 class ImageRequest(BaseModel):
     prompt: str
@@ -332,80 +301,21 @@ class ImageRequest(BaseModel):
 @app.post("/generate-image")
 async def generate_image(body: ImageRequest):
     """
-    Generates an image using multiple free services with automatic retries.
-    Tries: Pollinations (3 attempts) → Prodia → Hugging Face
+    Generates image URL using Pollinations AI.
+    Returns URL directly without testing - browser will load it.
     """
     prompt = (body.prompt or "").strip()
     if not prompt:
         raise HTTPException(status_code=400, detail="`prompt` is required")
 
-    # Try Pollinations first (3 attempts with different seeds)
-    for attempt in range(3):
-        try:
-            seed = random.randint(0, 999999)
-            encoded = quote(prompt)
-            image_url = f"https://image.pollinations.ai/prompt/{encoded}?width=1024&height=1024&nologo=true&seed={seed}"
-            
-            # Test if the URL is accessible
-            test_response = requests.head(image_url, timeout=5)
-            if test_response.status_code == 200:
-                return {
-                    "imageUrl": image_url,
-                    "service": "pollinations",
-                    "success": True
-                }
-        except Exception as e:
-            print(f"Pollinations attempt {attempt + 1} failed: {str(e)}")
-            if attempt < 2:
-                await asyncio.sleep(1)  # Wait 1 second before retry
-            continue
+    # Generate unique URL with random seed
+    seed = random.randint(0, 999999)
+    encoded = quote(prompt)
+    image_url = f"https://image.pollinations.ai/prompt/{encoded}?width=1024&height=1024&nologo=true&seed={seed}"
     
-    # Fallback 1: Try Prodia (alternative free service)
-    try:
-        # Prodia doesn't need API key for basic usage
-        seed = random.randint(0, 999999)
-        encoded = quote(prompt)
-        prodia_url = f"https://image.pollinations.ai/prompt/{encoded}?model=turbo&width=1024&height=1024&seed={seed}"
-        
-        test_response = requests.head(prodia_url, timeout=5)
-        if test_response.status_code == 200:
-            return {
-                "imageUrl": prodia_url,
-                "service": "prodia",
-                "success": True
-            }
-    except Exception as e:
-        print(f"Prodia failed: {str(e)}")
-    
-    # Fallback 2: Try Hugging Face Stable Diffusion
-    try:
-        HF_API_URL = "https://api-inference.huggingface.co/models/stabilityai/stable-diffusion-2-1"
-        
-        response = requests.post(
-            HF_API_URL,
-            headers={"Content-Type": "application/json"},
-            json={"inputs": prompt},
-            timeout=30
-        )
-        
-        if response.status_code == 200:
-            # Convert image bytes to base64
-            image_bytes = response.content
-            image_base64 = base64.b64encode(image_bytes).decode('utf-8')
-            image_data_url = f"data:image/jpeg;base64,{image_base64}"
-            
-            return {
-                "imageUrl": image_data_url,
-                "service": "huggingface",
-                "success": True
-            }
-    except Exception as e:
-        print(f"Hugging Face failed: {str(e)}")
-    
-    # All services failed
+    # Return URL directly - no testing needed!
     return {
-        "imageUrl": "",
-        "service": "none",
-        "success": False,
-        "error": "All image generation services are currently unavailable. Please try again in a moment!"
+        "imageUrl": image_url,
+        "service": "pollinations",
+        "success": True
     }
