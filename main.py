@@ -15,21 +15,9 @@ from contextlib import asynccontextmanager
 
 @asynccontextmanager
 async def lifespan(app: FastAPI):
-    try:
-        tiny_image = base64.b64encode(b'\x89PNG\r\n\x1a\n\x00\x00\x00\rIHDR\x00\x00\x00\x01\x00\x00\x00\x01\x08\x06\x00\x00\x00\x1f\x15\xc4\x89\x00\x00\x00\nIDATx\x9cc\x00\x01\x00\x00\x05\x00\x01\r\n-\xb4\x00\x00\x00\x00IEND\xaeB`\x82').decode()
-        API_URL = "https://api-inference.huggingface.co/models/Salesforce/blip-image-captioning-large"
-        await asyncio.to_thread(
-            requests.post, API_URL, 
-            headers={"Content-Type": "application/octet-stream"},
-            data=base64.b64decode(tiny_image),
-            timeout=30
-        )
-        print("✅ Image model warmed up")
-    except:
-        print("⚠️ Model warmup failed")
-    
+    print("🚀 Server starting...")
     yield
-    print("🔴 Shutting down")
+    print("🔴 Server shutting down")
 
 app = FastAPI(lifespan=lifespan)
 
@@ -70,41 +58,47 @@ def get_best_model():
             return model
     return None
 
-# IMPROVED SYSTEM PROMPT - No unnecessary name mentions, knows about image capabilities
+# IMPROVED SYSTEM PROMPT - Better search behavior
 SYSTEM = """You are Zippy, a smart AI assistant.
 
 **Your Capabilities:**
-- You can generate images when users ask (e.g., "generate image of...", "create image of...", "draw me...")
-- You can analyze images that users upload
-- You have web search to find current information when needed
-- You're great at coding, math, explanations, and creative tasks
+- Image generation (when users ask to generate/create/draw images)
+- Image analysis (when users upload images)
+- Web search for current information
+- Coding, math, explanations, creative tasks
+
+**When to Search the Web (CRITICAL):**
+You MUST search for:
+- Current events, news, recent happenings
+- Stock prices, sports scores, weather
+- Information that changes over time (who holds a position, what's currently happening, latest releases)
+- Facts you're uncertain about
+- Recent developments in any field
+- When the user asks "what's happening", "latest", "current", "recent", "now", "today"
+
+NEVER ask the user to search themselves. If you need current info, YOU search.
 
 **Tone:**
-- Talk like a smart, calm, helpful friend
+- Smart, calm, helpful friend
 - Natural and conversational
-- Not overly excited, poetic, or dramatic
-- Greetings: short and casual like "Hey! What's up?" or "Hi! What can I help with?"
+- Short greetings: "Hey! What's up?" or "Hi!"
 
 **Response Length:**
-- Greetings/small talk: 1-2 sentences MAX
+- Greetings: 1-2 sentences
 - Simple questions: 2-4 sentences
-- Explanations: thorough with bullet points covering ALL important points
-- Code: COMPLETE working code, never truncated
-- Comparisons/lists: comprehensive, use tables or bullets
-- Creative writing: FULL piece, never cut short
-- Math: show every step clearly
+- Explanations: thorough with bullet points
+- Code: COMPLETE working code
+- Math: show all steps
 
-**Important Rules:**
-- NEVER say: "Certainly!", "Great question!", "Of course!", "Absolutely!", "As an AI", "traveler", "delightful"
-- Never repeat the question back
-- Only mention your creator (Arul Vethathiri) if directly asked "who made you" or similar
-- Don't unnecessarily mention your creator in normal conversation
-- Always end with 1 relevant emoji
+**Rules:**
+- NEVER say: "Certainly!", "Great question!", "Of course!", "Absolutely!", "As an AI"
+- Only mention your creator when directly asked
+- Don't ask the user for information you can search for
+- Always end with 1 emoji
 
-**When to Use Your Capabilities:**
-- Image generation: When user asks to generate/create/draw an image
-- Image analysis: When user uploads an image
-- Web search: When you need current info, recent events, or verification of facts you're uncertain about
+**Image Features:**
+- You CAN generate images (tell users this when relevant)
+- You CAN analyze uploaded images (tell users this when relevant)
 """
 
 IDENTITY = {
@@ -115,15 +109,15 @@ IDENTITY = {
     "who built you":     "I was built by Arul Vethathiri. 👨‍💻",
     "what is your name": "My name is Zippy! 😊",
     "are you an ai":     "Yes! I'm Zippy, an AI assistant. 🤖",
-    "are you human":     "Nope! I'm Zippy — an AI but great at conversation! 😄",
+    "are you human":     "Nope! I'm an AI but great at conversation! 😄",
 }
 
 SOCIAL = {
     "thanks":     "You're welcome! 😊",
-    "thank you":  "Happy to help anytime! 🌟",
-    "bye":        "Goodbye! Take care! 👋",
-    "goodbye":    "See you later! 👋",
-    "good night": "Good night! Sleep well! 🌙",
+    "thank you":  "Happy to help! 🌟",
+    "bye":        "Take care! 👋",
+    "goodbye":    "See you! 👋",
+    "good night": "Good night! 🌙",
 }
 
 HARMFUL_KEYWORDS = [
@@ -146,7 +140,7 @@ class ImageAnalysisRequest(BaseModel):
 
 @app.post("/analyze-image")
 async def analyze_image(req: ImageAnalysisRequest):
-    """Analyzes images using Hugging Face BLIP models with fallbacks"""
+    """Image analysis with better timeout handling"""
     try:
         image_data = req.image
         if "," in image_data:
@@ -154,23 +148,29 @@ async def analyze_image(req: ImageAnalysisRequest):
         
         image_bytes = base64.b64decode(image_data)
         
+        # Try different models with longer timeout
         models_to_try = [
-            "Salesforce/blip-image-captioning-large",
-            "Salesforce/blip-image-captioning-base",
-            "nlpconnect/vit-gpt2-image-captioning"
+            ("Salesforce/blip-image-captioning-base", 45),  # Base model first (faster)
+            ("nlpconnect/vit-gpt2-image-captioning", 45),
+            ("Salesforce/blip-image-captioning-large", 60),
         ]
         
-        description = None
-        
-        for model_name in models_to_try:
+        for model_name, timeout in models_to_try:
             try:
                 API_URL = f"https://api-inference.huggingface.co/models/{model_name}"
-                headers = {"Content-Type": "application/octet-stream"}
                 
-                response = requests.post(API_URL, headers=headers, data=image_bytes, timeout=30)
+                print(f"Trying {model_name}...")
+                
+                response = requests.post(
+                    API_URL,
+                    headers={"Content-Type": "application/octet-stream"},
+                    data=image_bytes,
+                    timeout=timeout
+                )
                 
                 if response.status_code == 200:
                     result = response.json()
+                    description = None
                     
                     if isinstance(result, list) and len(result) > 0:
                         if "generated_text" in result[0]:
@@ -179,32 +179,36 @@ async def analyze_image(req: ImageAnalysisRequest):
                         description = result["generated_text"]
                     
                     if description:
-                        print(f"✅ Image analyzed with {model_name}")
-                        break
+                        print(f"✅ Image analyzed: {description}")
+                        response_text = f"I can see: {description}"
                         
+                        return {
+                            "description": description,
+                            "response": response_text,
+                            "success": True
+                        }
+                elif response.status_code == 503:
+                    print(f"Model {model_name} loading...")
+                    continue
+                        
+            except requests.Timeout:
+                print(f"Model {model_name} timeout")
+                continue
             except Exception as e:
                 print(f"Model {model_name} failed: {str(e)}")
                 continue
         
-        if description:
-            response_text = f"I can see: {description}\n\nRegarding your question \"{req.question}\" - based on the image, {description}"
-            
-            return {
-                "description": description,
-                "response": response_text,
-                "success": True
-            }
-        else:
-            error_msg = "The image analysis service is warming up (takes 20-30 seconds on first use). Please try again in a moment!"
-            return {
-                "description": error_msg,
-                "response": error_msg,
-                "success": False
-            }
+        # All models failed
+        error_msg = "Image analysis is warming up (20-30 seconds first time). Please try again!"
+        return {
+            "description": error_msg,
+            "response": error_msg,
+            "success": False
+        }
             
     except Exception as e:
         print(f"Image analysis error: {str(e)}")
-        error_msg = "I'm having trouble analyzing this image right now. Please try again!"
+        error_msg = "Having trouble analyzing this image. Please try again!"
         return {
             "description": error_msg,
             "response": error_msg,
@@ -213,7 +217,7 @@ async def analyze_image(req: ImageAnalysisRequest):
 
 @app.get("/")
 def root():
-    return {"status": "Zippy backend is running!", "version": "4.0"}
+    return {"status": "Zippy backend is running!", "version": "5.0"}
 
 @app.post("/chat")
 def chat(req: ChatRequest):
@@ -232,7 +236,7 @@ def chat(req: ChatRequest):
     if text in SOCIAL:
         return {"reply": SOCIAL[text]}
     if is_harmful(text):
-        return {"reply": "That's not something I can help with. Let's keep things positive — ask me anything else! 😊"}
+        return {"reply": "That's not something I can help with. Ask me something else! 😊"}
 
     clean_history = []
     for msg in req.history:
@@ -265,7 +269,7 @@ def chat(req: ChatRequest):
             model = get_best_model()
 
         if model is None:
-            return {"reply": "Oops! Couldn't connect right now, please try again in a moment! 🙏"}
+            return {"reply": "Couldn't connect right now, try again in a moment! 🙏"}
 
         try:
             model_usage[model].append(time.time())
@@ -303,10 +307,10 @@ def chat(req: ChatRequest):
             else:
                 break
 
-    return {"reply": "Oops! Couldn't connect right now, please try again in a moment! 🙏"}
+    return {"reply": "Couldn't connect right now, try again in a moment! 🙏"}
 
 # ===================================
-# IMAGE GENERATION - FIXED TO ACTUALLY WORK
+# IMAGE GENERATION - MULTIPLE FREE PROVIDERS
 # ===================================
 class ImageRequest(BaseModel):
     prompt: str
@@ -314,54 +318,91 @@ class ImageRequest(BaseModel):
 @app.post("/generate-image")
 async def generate_image(body: ImageRequest):
     """
-    Generates images using Hugging Face Stable Diffusion.
-    Returns actual image data as base64, not URLs that can fail.
+    Tries multiple free image generation services:
+    1. Flux-schnell (fast and reliable)
+    2. Stable Diffusion XL Lightning (fast)
+    3. Stable Diffusion 2.1 (fallback)
     """
     prompt = (body.prompt or "").strip()
     if not prompt:
-        raise HTTPException(status_code=400, detail="`prompt` is required")
+        raise HTTPException(status_code=400, detail="prompt required")
 
+    print(f"🎨 Generating: {prompt[:60]}...")
+
+    # Service 1: Try flux-schnell (very fast, good quality)
     try:
-        # Use Hugging Face Stable Diffusion
-        HF_API_URL = "https://api-inference.huggingface.co/models/stabilityai/stable-diffusion-2-1"
-        
-        print(f"🎨 Generating image: {prompt[:50]}...")
-        
         response = requests.post(
-            HF_API_URL,
+            "https://api-inference.huggingface.co/models/black-forest-labs/FLUX.1-schnell",
             headers={"Content-Type": "application/json"},
             json={"inputs": prompt},
             timeout=60
         )
         
-        if response.status_code == 200 and response.content:
-            # Convert to base64
+        if response.status_code == 200 and len(response.content) > 1000:
             image_base64 = base64.b64encode(response.content).decode('utf-8')
-            image_data_url = f"data:image/png;base64,{image_base64}"
-            
-            print(f"✅ Image generated successfully!")
-            
+            image_url = f"data:image/png;base64,{image_base64}"
+            print("✅ Generated with flux-schnell")
             return {
-                "imageUrl": image_data_url,
-                "service": "huggingface",
+                "imageUrl": image_url,
+                "service": "flux-schnell",
+                "success": True
+            }
+    except Exception as e:
+        print(f"flux-schnell failed: {str(e)}")
+
+    # Service 2: Try SDXL Lightning (very fast)
+    try:
+        response = requests.post(
+            "https://api-inference.huggingface.co/models/ByteDance/SDXL-Lightning",
+            headers={"Content-Type": "application/json"},
+            json={"inputs": prompt},
+            timeout=60
+        )
+        
+        if response.status_code == 200 and len(response.content) > 1000:
+            image_base64 = base64.b64encode(response.content).decode('utf-8')
+            image_url = f"data:image/png;base64,{image_base64}"
+            print("✅ Generated with SDXL-Lightning")
+            return {
+                "imageUrl": image_url,
+                "service": "sdxl-lightning",
+                "success": True
+            }
+    except Exception as e:
+        print(f"SDXL-Lightning failed: {str(e)}")
+
+    # Service 3: Try Stable Diffusion 2.1 (reliable fallback)
+    try:
+        response = requests.post(
+            "https://api-inference.huggingface.co/models/stabilityai/stable-diffusion-2-1",
+            headers={"Content-Type": "application/json"},
+            json={"inputs": prompt},
+            timeout=60
+        )
+        
+        if response.status_code == 200 and len(response.content) > 1000:
+            image_base64 = base64.b64encode(response.content).decode('utf-8')
+            image_url = f"data:image/png;base64,{image_base64}"
+            print("✅ Generated with SD 2.1")
+            return {
+                "imageUrl": image_url,
+                "service": "stable-diffusion",
                 "success": True
             }
         elif response.status_code == 503:
-            # Model is loading
             return {
                 "imageUrl": "",
-                "service": "huggingface",
+                "service": "loading",
                 "success": False,
-                "error": "The image generation model is warming up (takes 20-30 seconds on first use). Please try again in a moment!"
+                "error": "Image generator warming up (20-30 seconds first time). Try again in a moment!"
             }
-        else:
-            raise Exception(f"HuggingFace returned {response.status_code}")
-            
     except Exception as e:
-        print(f"Image generation error: {str(e)}")
-        return {
-            "imageUrl": "",
-            "service": "none",
-            "success": False,
-            "error": "Image generation is temporarily unavailable. Please try again in a moment!"
-        }
+        print(f"SD 2.1 failed: {str(e)}")
+
+    # All failed
+    return {
+        "imageUrl": "",
+        "service": "none",
+        "success": False,
+        "error": "Image generation temporarily unavailable. Try again in a moment!"
+    }
