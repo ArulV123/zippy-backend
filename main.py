@@ -1,17 +1,21 @@
-from fastapi import FastAPI
+from fastapi import FastAPI, HTTPException
 from fastapi.middleware.cors import CORSMiddleware
 from pydantic import BaseModel
 from groq import Groq
 import os
 import re
 import time
+import random
 from collections import defaultdict
+from urllib.parse import quote
 
 app = FastAPI()
 
+# Allowed origins (your frontend)
 origins = ["https://arulv123.github.io"]
 
-client = Groq(api_key=os.environ["GROQ_API_KEY"])
+# GROQ client (make sure GROQ_API_KEY is set in environment)
+client = Groq(api_key=os.environ.get("GROQ_API_KEY", ""))
 
 app.add_middleware(
     CORSMiddleware,
@@ -38,7 +42,7 @@ MAX_RPM = 18  # stay under 20/min limit with buffer
 def get_best_model():
     now = time.time()
     for model in MODELS:
-        # Skip if blocked due to 429
+        # Skip if blocked due to 429 or invalid
         if model in model_blocked_until:
             if now < model_blocked_until[model]:
                 continue
@@ -154,12 +158,12 @@ def chat(req: ChatRequest):
     messages += filtered
     messages.append({"role": "user", "content": user_input})
 
-    # Try up to 6 times across models
+    # Try up to len(MODELS) times across models
     for attempt in range(len(MODELS)):
         model = get_best_model()
 
         if model is None:
-            # All models busy right now, wait 5 seconds and retry once
+            # All models busy right now, brief pause then retry
             time.sleep(5)
             model = get_best_model()
 
@@ -205,3 +209,25 @@ def chat(req: ChatRequest):
                 break
 
     return {"reply": "Oops! Couldn't connect to Zippy, please wait a moment and try again! 🙏"}
+
+# -------------------------
+# Image generation endpoint
+# -------------------------
+class ImageRequest(BaseModel):
+    prompt: str
+
+@app.post("/generate-image")
+async def generate_image(body: ImageRequest):
+    """
+    Returns a Pollinations image URL for the given prompt.
+    Frontend can fetch this URL directly (avoids client-side CORS problems).
+    """
+    prompt = (body.prompt or "").strip()
+    if not prompt:
+        raise HTTPException(status_code=400, detail="`prompt` is required")
+
+    # Build a random-seeded image URL (same pattern as the JS example)
+    seed = random.randint(0, 99999)
+    encoded = quote(prompt)
+    image_url = f"https://image.pollinations.ai/prompt/{encoded}?width=1024&height=1024&nologo=true&seed={seed}"
+    return {"imageUrl": image_url}
