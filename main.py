@@ -15,7 +15,6 @@ from contextlib import asynccontextmanager
 
 @asynccontextmanager
 async def lifespan(app: FastAPI):
-    # Startup: Warm up image model
     try:
         tiny_image = base64.b64encode(b'\x89PNG\r\n\x1a\n\x00\x00\x00\rIHDR\x00\x00\x00\x01\x00\x00\x00\x01\x08\x06\x00\x00\x00\x1f\x15\xc4\x89\x00\x00\x00\nIDATx\x9cc\x00\x01\x00\x00\x05\x00\x01\r\n-\xb4\x00\x00\x00\x00IEND\xaeB`\x82').decode()
         API_URL = "https://api-inference.huggingface.co/models/Salesforce/blip-image-captioning-large"
@@ -27,20 +26,14 @@ async def lifespan(app: FastAPI):
         )
         print("✅ Image model warmed up")
     except:
-        print("⚠️ Model warmup failed (will work on first real use)")
+        print("⚠️ Model warmup failed")
     
     yield
-    print("🔴 Server shutting down")
+    print("🔴 Shutting down")
 
 app = FastAPI(lifespan=lifespan)
 
-origins = [
-    "https://arulv123.github.io",
-    "http://localhost:8000",
-    "http://127.0.0.1:8000",
-    "*"
-]
-
+origins = ["https://arulv123.github.io", "http://localhost:8000", "http://127.0.0.1:8000", "*"]
 client = Groq(api_key=os.environ.get("GROQ_API_KEY", ""))
 
 app.add_middleware(
@@ -191,7 +184,7 @@ async def analyze_image(req: ImageAnalysisRequest):
             
     except Exception as e:
         print(f"Image analysis error: {str(e)}")
-        error_msg = f"I can see you've uploaded an image, but I'm having trouble analyzing it right now. Please try again! Error: {str(e)[:100]}"
+        error_msg = f"I can see you've uploaded an image, but I'm having trouble analyzing it right now. Please try again!"
         return {
             "description": error_msg,
             "response": error_msg,
@@ -200,7 +193,7 @@ async def analyze_image(req: ImageAnalysisRequest):
 
 @app.get("/")
 def root():
-    return {"status": "Zippy backend is running!", "version": "3.1"}
+    return {"status": "Zippy backend is running!", "version": "3.2"}
 
 @app.post("/chat")
 def chat(req: ChatRequest):
@@ -274,7 +267,7 @@ def chat(req: ChatRequest):
             if any(hint in reply.lower() for hint in refusal_hints):
                 return {"reply": "That's not something I can help with. Ask me something else! 😊"}
 
-            print(f"✅ Served by: {model} ({len(model_usage[model])}/min)")
+            print(f"✅ Served by: {model}")
             return {"reply": reply}
 
         except Exception as e:
@@ -293,7 +286,7 @@ def chat(req: ChatRequest):
     return {"reply": "Oops! Couldn't connect to Zippy, please wait a moment and try again! 🙏"}
 
 # ===================================
-# SIMPLIFIED IMAGE GENERATION - NO URL TESTING
+# IMAGE GENERATION - MULTIPLE WORKING SERVICES
 # ===================================
 class ImageRequest(BaseModel):
     prompt: str
@@ -301,21 +294,71 @@ class ImageRequest(BaseModel):
 @app.post("/generate-image")
 async def generate_image(body: ImageRequest):
     """
-    Generates image URL using Pollinations AI.
-    Returns URL directly without testing - browser will load it.
+    Tries multiple free image generation services in order:
+    1. Hugging Face Stable Diffusion (most reliable)
+    2. Pollinations (fallback)
+    3. Fal.ai (fallback)
     """
     prompt = (body.prompt or "").strip()
     if not prompt:
         raise HTTPException(status_code=400, detail="`prompt` is required")
 
-    # Generate unique URL with random seed
-    seed = random.randint(0, 999999)
-    encoded = quote(prompt)
-    image_url = f"https://image.pollinations.ai/prompt/{encoded}?width=1024&height=1024&nologo=true&seed={seed}"
+    # Try Hugging Face Stable Diffusion first (most reliable)
+    try:
+        HF_API_URL = "https://api-inference.huggingface.co/models/stabilityai/stable-diffusion-2-1"
+        
+        response = requests.post(
+            HF_API_URL,
+            headers={"Content-Type": "application/json"},
+            json={"inputs": prompt},
+            timeout=60
+        )
+        
+        if response.status_code == 200 and response.content:
+            # Convert to base64
+            image_base64 = base64.b64encode(response.content).decode('utf-8')
+            image_data_url = f"data:image/jpeg;base64,{image_base64}"
+            
+            return {
+                "imageUrl": image_data_url,
+                "service": "huggingface",
+                "success": True
+            }
+    except Exception as e:
+        print(f"HuggingFace failed: {str(e)}")
     
-    # Return URL directly - no testing needed!
+    # Fallback: Try Pollinations
+    try:
+        seed = random.randint(0, 999999)
+        encoded = quote(prompt)
+        pollinations_url = f"https://image.pollinations.ai/prompt/{encoded}?width=1024&height=1024&nologo=true&seed={seed}"
+        
+        return {
+            "imageUrl": pollinations_url,
+            "service": "pollinations",
+            "success": True
+        }
+    except Exception as e:
+        print(f"Pollinations failed: {str(e)}")
+    
+    # Last resort: Fal.ai
+    try:
+        seed = random.randint(0, 999999)
+        encoded = quote(prompt)
+        fal_url = f"https://fal.run/fal-ai/fast-sdxl/generate?prompt={encoded}&seed={seed}"
+        
+        return {
+            "imageUrl": fal_url,
+            "service": "fal",
+            "success": True
+        }
+    except Exception as e:
+        print(f"Fal.ai failed: {str(e)}")
+    
+    # All failed
     return {
-        "imageUrl": image_url,
-        "service": "pollinations",
-        "success": True
+        "imageUrl": "",
+        "service": "none",
+        "success": False,
+        "error": "All image generation services are currently unavailable. Please try again in a moment!"
     }
