@@ -7,12 +7,15 @@ import re
 import time
 import random
 import base64
-import requests
+import asyncio
 from collections import defaultdict
 from urllib.parse import quote
-import asyncio
 from contextlib import asynccontextmanager
+import httpx
 
+# ----------------------------------------------------------------------
+# Basic app + lifecycle
+# ----------------------------------------------------------------------
 @asynccontextmanager
 async def lifespan(app: FastAPI):
     print("🚀 Server starting...")
@@ -32,6 +35,9 @@ app.add_middleware(
     allow_headers=["*"],
 )
 
+# ----------------------------------------------------------------------
+# Model rotation / usage tracking
+# ----------------------------------------------------------------------
 MODELS = [
     "llama-3.3-70b-versatile",
     "llama-3.1-8b-instant",
@@ -58,7 +64,9 @@ def get_best_model():
             return model
     return None
 
-# IMPROVED SYSTEM PROMPT - Better search behavior
+# ----------------------------------------------------------------------
+# System prompt, identity, helpers
+# ----------------------------------------------------------------------
 SYSTEM = """You are Zippy, a smart AI assistant.
 
 **Your Capabilities:**
@@ -130,6 +138,37 @@ HARMFUL_KEYWORDS = [
 def is_harmful(text: str) -> bool:
     return any(k in text.lower() for k in HARMFUL_KEYWORDS)
 
+# Environment keys
+HUGGINGFACE_API_KEY = os.environ.get("HUGGINGFACE_API_KEY", "")
+SERPAPI_API_KEY = os.environ.get("SERPAPI_API_KEY", "")
+
+# ----------------------------------------------------------------------
+# Simple SerpAPI helper (optional) - synchronous but small
+# ----------------------------------------------------------------------
+def web_search_sync(query: str, max_results: int = 3):
+    results = []
+    if not SERPAPI_API_KEY:
+        return results
+    try:
+        import requests as _requests
+        url = "https://serpapi.com/search.json"
+        params = {"q": query, "api_key": SERPAPI_API_KEY, "num": max_results}
+        r = _requests.get(url, params=params, timeout=8)
+        if r.status_code == 200:
+            data = r.json()
+            for item in data.get("organic_results", [])[:max_results]:
+                results.append({
+                    "title": item.get("title"),
+                    "snippet": item.get("snippet") or item.get("snippet_text") or "",
+                    "link": item.get("link") or item.get("url")
+                })
+    except Exception as e:
+        print("web_search_sync error:", e)
+    return results
+
+# ----------------------------------------------------------------------
+# Request/response models
+# ----------------------------------------------------------------------
 class ChatRequest(BaseModel):
     message: str
     history: list = []
@@ -138,83 +177,117 @@ class ImageAnalysisRequest(BaseModel):
     image: str
     question: str = "What's in this image?"
 
+class ImageRequest(BaseModel):
+    prompt: str
+
+# ----------------------------------------------------------------------
+# Helper: convert content to data-url base64
+# ----------------------------------------------------------------------
+def to_data_url_png(content_bytes: bytes) -> str:
+    b64 = base64.b64encode(content_bytes).decode("utf-8")
+    return f"data:image/png;base64,{b64}"
+
+# ----------------------------------------------------------------------
+# IMAGE ANALYSIS (async, httpx, retries, HF models)
+# ----------------------------------------------------------------------
 @app.post("/analyze-image")
 async def analyze_image(req: ImageAnalysisRequest):
-    """Image analysis with better timeout handling"""
     try:
-        image_data = req.image
+        image_data = req.image or ""
         if "," in image_data:
             image_data = image_data.split(",")[1]
-        
-        image_bytes = base64.b64decode(image_data)
-        
-        # Try different models with longer timeout
+
+        try:
+            image_bytes = base64.b64decode(image_data)
+        except Exception:
+            raise HTTPException(status_code=400, detail="Invalid base64 image")
+
+        hf_headers = {}
+        if HUGGINGFACE_API_KEY:
+            hf_headers["Authorization"] = f"Bearer {HUGGINGFACE_API_KEY}"
+
         models_to_try = [
-            ("Salesforce/blip-image-captioning-base", 45),  # Base model first (faster)
-            ("nlpconnect/vit-gpt2-image-captioning", 45),
+            ("Salesforce/blip-image-captioning-base", 30),
+            ("nlpconnect/vit-gpt2-image-captioning", 30),
             ("Salesforce/blip-image-captioning-large", 60),
         ]
-        
-        for model_name, timeout in models_to_try:
-            try:
-                API_URL = f"https://api-inference.huggingface.co/models/{model_name}"
-                
-                print(f"Trying {model_name}...")
-                
-                response = requests.post(
-                    API_URL,
-                    headers={"Content-Type": "application/octet-stream"},
-                    data=image_bytes,
-                    timeout=timeout
-                )
-                
-                if response.status_code == 200:
-                    result = response.json()
-                    description = None
-                    
-                    if isinstance(result, list) and len(result) > 0:
-                        if "generated_text" in result[0]:
-                            description = result[0]["generated_text"]
-                    elif isinstance(result, dict) and "generated_text" in result:
-                        description = result["generated_text"]
-                    
-                    if description:
-                        print(f"✅ Image analyzed: {description}")
-                        response_text = f"I can see: {description}"
-                        
-                        return {
-                            "description": description,
-                            "response": response_text,
-                            "success": True
-                        }
-                elif response.status_code == 503:
-                    print(f"Model {model_name} loading...")
-                    continue
-                        
-            except requests.Timeout:
-                print(f"Model {model_name} timeout")
-                continue
-            except Exception as e:
-                print(f"Model {model_name} failed: {str(e)}")
-                continue
-        
-        # All models failed
-        error_msg = "Image analysis is warming up (20-30 seconds first time). Please try again!"
-        return {
-            "description": error_msg,
-            "response": error_msg,
-            "success": False
-        }
-            
-    except Exception as e:
-        print(f"Image analysis error: {str(e)}")
-        error_msg = "Having trouble analyzing this image. Please try again!"
-        return {
-            "description": error_msg,
-            "response": error_msg,
-            "success": False
-        }
 
+        async with httpx.AsyncClient(timeout=None) as client:
+            for model_name, timeout in models_to_try:
+                api_url = f"https://api-inference.huggingface.co/models/{model_name}"
+                print(f"Trying {model_name} for analysis...")
+                try:
+                    # Post binary image; ask HF to wait for model
+                    resp = await client.post(
+                        api_url,
+                        headers={**hf_headers, "Content-Type": "application/octet-stream"},
+                        content=image_bytes,
+                        params={"wait_for_model": "true"},
+                        timeout=timeout
+                    )
+                except httpx.TimeoutException:
+                    print(f"{model_name} timeout")
+                    continue
+                except Exception as e:
+                    print(f"{model_name} request failed: {e}")
+                    continue
+
+                if resp.status_code == 200:
+                    ctype = resp.headers.get("content-type", "")
+                    # JSON response with text
+                    if "application/json" in ctype:
+                        try:
+                            data = resp.json()
+                        except Exception:
+                            data = None
+                        description = None
+                        if isinstance(data, list) and len(data) > 0 and isinstance(data[0], dict):
+                            # sometimes list[{"generated_text": "..."}]
+                            if "generated_text" in data[0]:
+                                description = data[0]["generated_text"]
+                        elif isinstance(data, dict):
+                            if "generated_text" in data:
+                                description = data["generated_text"]
+                            # some HF caption models return {"caption": "..."} or "result" etc.
+                            if not description:
+                                for key in ("caption", "result", "description", "text"):
+                                    if key in data and isinstance(data[key], str):
+                                        description = data[key]
+                                        break
+
+                        if description:
+                            print(f"✅ Image analyzed by {model_name}: {description}")
+                            return {"description": description, "response": f"I can see: {description}", "success": True}
+                        else:
+                            # fallback: try parse text body
+                            text = resp.text.strip()
+                            if text:
+                                print(f"⚠️ Parsed text fallback from {model_name}")
+                                return {"description": text[:4000], "response": f"I can see: {text[:4000]}", "success": True}
+                    else:
+                        # If the model returned image or bytes (rare for captioning) — decode and attempt call to text model (skip)
+                        text = resp.text.strip()
+                        if text:
+                            return {"description": text[:4000], "response": f"I can see: {text[:4000]}", "success": True}
+
+                elif resp.status_code == 503:
+                    print(f"{model_name} loading (503), trying next")
+                    continue
+                else:
+                    print(f"{model_name} returned {resp.status_code}: {resp.text[:300]}")
+                    continue
+
+        # All failed
+        error_msg = "Image analysis is warming up or unavailable. Try again in a few seconds."
+        return {"description": error_msg, "response": error_msg, "success": False}
+
+    except Exception as e:
+        print("Image analysis error:", e)
+        return {"description": "Having trouble analyzing this image. Please try again!", "response": "Having trouble analyzing this image. Please try again!", "success": False}
+
+# ----------------------------------------------------------------------
+# Root & chat (keeps your existing chat logic, with optional web search injection)
+# ----------------------------------------------------------------------
 @app.get("/")
 def root():
     return {"status": "Zippy backend is running!", "version": "5.0"}
@@ -223,7 +296,7 @@ def root():
 def chat(req: ChatRequest):
     user_input = re.sub(
         r'^(mm+|um+|uh+|hmm+|hm+|err+|ah+|oh+)\s+',
-        '', req.message, flags=re.IGNORECASE
+        '', req.message or "", flags=re.IGNORECASE
     ).strip()
 
     if not user_input:
@@ -239,7 +312,7 @@ def chat(req: ChatRequest):
         return {"reply": "That's not something I can help with. Ask me something else! 😊"}
 
     clean_history = []
-    for msg in req.history:
+    for msg in req.history or []:
         try:
             role = msg.get("role", "") if isinstance(msg, dict) else ""
             content = msg.get("content", "") if isinstance(msg, dict) else ""
@@ -258,6 +331,19 @@ def chat(req: ChatRequest):
             last_role = msg["role"]
 
     messages = [{"role": "system", "content": SYSTEM}]
+
+    # Heuristic: if query likely needs current info, do a web search (SerpAPI required)
+    try:
+        if re.search(r'\b(latest|today|now|news|who is|who was|president|current|score|price)\b', user_input, flags=re.I):
+            search_results = web_search_sync(user_input, max_results=3)
+            if search_results:
+                sr_text = "Web search results (top):\n"
+                for i, r in enumerate(search_results, 1):
+                    sr_text += f"{i}. {r.get('title') or ''}\n{r.get('snippet') or ''}\nSource: {r.get('link') or ''}\n\n"
+                messages.append({"role": "system", "content": sr_text})
+    except Exception as e:
+        print("web search injection error:", e)
+
     messages += filtered
     messages.append({"role": "user", "content": user_input})
 
@@ -309,100 +395,122 @@ def chat(req: ChatRequest):
 
     return {"reply": "Couldn't connect right now, try again in a moment! 🙏"}
 
-# ===================================
-# IMAGE GENERATION - MULTIPLE FREE PROVIDERS
-# ===================================
-class ImageRequest(BaseModel):
-    prompt: str
-
+# ----------------------------------------------------------------------
+# IMAGE GENERATION - Pollinations primary, HF fallbacks (async, robust)
+# ----------------------------------------------------------------------
 @app.post("/generate-image")
 async def generate_image(body: ImageRequest):
-    """
-    Tries multiple free image generation services:
-    1. Flux-schnell (fast and reliable)
-    2. Stable Diffusion XL Lightning (fast)
-    3. Stable Diffusion 2.1 (fallback)
-    """
     prompt = (body.prompt or "").strip()
     if not prompt:
         raise HTTPException(status_code=400, detail="prompt required")
 
-    print(f"🎨 Generating: {prompt[:60]}...")
+    print(f"🎨 Generating: {prompt[:120]}...")
+    encoded_prompt = quote(prompt)
+    seed = random.randint(1, 999999)
 
-    # Service 1: Try flux-schnell (very fast, good quality)
-    try:
-        response = requests.post(
-            "https://api-inference.huggingface.co/models/black-forest-labs/FLUX.1-schnell",
-            headers={"Content-Type": "application/json"},
-            json={"inputs": prompt},
-            timeout=60
-        )
-        
-        if response.status_code == 200 and len(response.content) > 1000:
-            image_base64 = base64.b64encode(response.content).decode('utf-8')
-            image_url = f"data:image/png;base64,{image_base64}"
-            print("✅ Generated with flux-schnell")
-            return {
-                "imageUrl": image_url,
-                "service": "flux-schnell",
-                "success": True
-            }
-    except Exception as e:
-        print(f"flux-schnell failed: {str(e)}")
+    # Use httpx async client
+    hf_headers = {}
+    if HUGGINGFACE_API_KEY:
+        hf_headers["Authorization"] = f"Bearer {HUGGINGFACE_API_KEY}"
 
-    # Service 2: Try SDXL Lightning (very fast)
-    try:
-        response = requests.post(
-            "https://api-inference.huggingface.co/models/ByteDance/SDXL-Lightning",
-            headers={"Content-Type": "application/json"},
-            json={"inputs": prompt},
-            timeout=60
-        )
-        
-        if response.status_code == 200 and len(response.content) > 1000:
-            image_base64 = base64.b64encode(response.content).decode('utf-8')
-            image_url = f"data:image/png;base64,{image_base64}"
-            print("✅ Generated with SDXL-Lightning")
-            return {
-                "imageUrl": image_url,
-                "service": "sdxl-lightning",
-                "success": True
-            }
-    except Exception as e:
-        print(f"SDXL-Lightning failed: {str(e)}")
+    async with httpx.AsyncClient(timeout=None) as client:
+        # ---------------------------
+        # 1) Pollinations (primary, free, fast)
+        # ---------------------------
+        try:
+            poll_url = f"https://image.pollinations.ai/prompt/{encoded_prompt}?seed={seed}&width=1024&height=1024"
+            for attempt in range(3):
+                try:
+                    resp = await client.get(poll_url, timeout=60)
+                except Exception as e:
+                    print("Pollinations request error:", e)
+                    resp = None
 
-    # Service 3: Try Stable Diffusion 2.1 (reliable fallback)
-    try:
-        response = requests.post(
-            "https://api-inference.huggingface.co/models/stabilityai/stable-diffusion-2-1",
-            headers={"Content-Type": "application/json"},
-            json={"inputs": prompt},
-            timeout=60
-        )
-        
-        if response.status_code == 200 and len(response.content) > 1000:
-            image_base64 = base64.b64encode(response.content).decode('utf-8')
-            image_url = f"data:image/png;base64,{image_base64}"
-            print("✅ Generated with SD 2.1")
-            return {
-                "imageUrl": image_url,
-                "service": "stable-diffusion",
-                "success": True
-            }
-        elif response.status_code == 503:
-            return {
-                "imageUrl": "",
-                "service": "loading",
-                "success": False,
-                "error": "Image generator warming up (20-30 seconds first time). Try again in a moment!"
-            }
-    except Exception as e:
-        print(f"SD 2.1 failed: {str(e)}")
+                if resp and resp.status_code == 200 and resp.content and len(resp.content) > 1000:
+                    image_url = to_data_url_png(resp.content)
+                    print("✅ Generated with Pollinations")
+                    return {"imageUrl": image_url, "service": "pollinations", "success": True}
+                else:
+                    print(f"Pollinations attempt {attempt+1} failed: status={(resp.status_code if resp else 'no resp')}")
+                    await asyncio.sleep(0.8)
+        except Exception as e:
+            print("Pollinations top-level error:", e)
 
-    # All failed
-    return {
-        "imageUrl": "",
-        "service": "none",
-        "success": False,
-        "error": "Image generation temporarily unavailable. Try again in a moment!"
-    }
+        # Helper for HF fallbacks
+        async def hf_generate(api_model: str, timeout_s: int = 90):
+            api_url = f"https://api-inference.huggingface.co/models/{api_model}"
+            payload = {"inputs": prompt, "options": {"wait_for_model": True}}
+            try:
+                resp = await client.post(
+                    api_url,
+                    headers={**hf_headers, "Content-Type": "application/json", "Accept": "application/octet-stream"},
+                    json=payload,
+                    timeout=timeout_s
+                )
+            except Exception as e:
+                print(f"{api_model} request error:", e)
+                return None
+
+            if resp.status_code == 200:
+                ctype = resp.headers.get("content-type", "")
+                # If binary image bytes returned
+                if "image" in ctype or "application/octet-stream" in ctype or resp.content:
+                    if len(resp.content) > 100:
+                        return resp.content
+                # If JSON returned, maybe base64 inside
+                if "application/json" in ctype:
+                    try:
+                        data = resp.json()
+                    except Exception:
+                        data = None
+                    # common keys that may hold base64 image
+                    for key in ("image", "image_base64", "b64_json", "base64", "generated_image"):
+                        if isinstance(data, dict) and key in data and isinstance(data[key], str) and len(data[key]) > 100:
+                            try:
+                                return base64.b64decode(data[key])
+                            except Exception:
+                                pass
+                    # some models return bytes in returned JSON arrays (rare); skip
+                # fallback: if resp.content present and >100 bytes use it
+                if resp.content and len(resp.content) > 100:
+                    return resp.content
+                return None
+            elif resp.status_code == 503:
+                print(f"{api_model} reported model loading (503).")
+                return None
+            else:
+                print(f"{api_model} returned {resp.status_code}: {resp.text[:200]}")
+                return None
+
+        # ---------------------------
+        # 2) HuggingFace: FLUX
+        # ---------------------------
+        try:
+            flux_bytes = await hf_generate("black-forest-labs/FLUX.1-schnell", timeout_s=90)
+            if flux_bytes:
+                return {"imageUrl": to_data_url_png(flux_bytes), "service": "flux-schnell", "success": True}
+        except Exception as e:
+            print("FLUX error:", e)
+
+        # ---------------------------
+        # 3) HuggingFace: SDXL Lightning
+        # ---------------------------
+        try:
+            sdxl_bytes = await hf_generate("ByteDance/SDXL-Lightning", timeout_s=90)
+            if sdxl_bytes:
+                return {"imageUrl": to_data_url_png(sdxl_bytes), "service": "sdxl-lightning", "success": True}
+        except Exception as e:
+            print("SDXL error:", e)
+
+        # ---------------------------
+        # 4) HuggingFace: Stable Diffusion 2.1 fallback
+        # ---------------------------
+        try:
+            sd_bytes = await hf_generate("stabilityai/stable-diffusion-2-1", timeout_s=120)
+            if sd_bytes:
+                return {"imageUrl": to_data_url_png(sd_bytes), "service": "stable-diffusion", "success": True}
+        except Exception as e:
+            print("SD 2.1 error:", e)
+
+    # All services failed
+    return {"imageUrl": "", "service": "none", "success": False, "error": "All image services failed or are warming up."}
