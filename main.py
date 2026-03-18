@@ -6,13 +6,20 @@ import os
 import re
 import time
 import random
+import base64
+import requests
 from collections import defaultdict
 from urllib.parse import quote
 
 app = FastAPI()
 
 # Allowed origins (your frontend)
-origins = ["https://arulv123.github.io"]
+origins = [
+    "https://arulv123.github.io",
+    "http://localhost:8000",
+    "http://127.0.0.1:8000",
+    "*"  # Allow all for testing, remove in production
+]
 
 # GROQ client (make sure GROQ_API_KEY is set in environment)
 client = Groq(api_key=os.environ.get("GROQ_API_KEY", ""))
@@ -110,9 +117,76 @@ class ChatRequest(BaseModel):
     message: str
     history: list = []
 
+class ImageAnalysisRequest(BaseModel):
+    image: str  # base64 encoded image
+    question: str = "What's in this image?"
+
 @app.get("/")
 def root():
-    return {"status": "Zippy backend is running!"}
+    return {"status": "Zippy backend is running!", "version": "2.0"}
+
+@app.post("/analyze-image")
+async def analyze_image(req: ImageAnalysisRequest):
+    """
+    Analyzes an image using Hugging Face's BLIP model (free, no API key needed).
+    Returns a description of what's in the image.
+    """
+    try:
+        # Remove data URL prefix if present
+        image_data = req.image
+        if "," in image_data:
+            image_data = image_data.split(",")[1]
+        
+        # Decode base64 to bytes
+        image_bytes = base64.b64decode(image_data)
+        
+        # Call Hugging Face Inference API (BLIP model for image captioning)
+        # This is completely free and doesn't require an API key
+        API_URL = "https://api-inference.huggingface.co/models/Salesforce/blip-image-captioning-large"
+        
+        headers = {"Content-Type": "application/octet-stream"}
+        
+        response = requests.post(API_URL, headers=headers, data=image_bytes, timeout=30)
+        
+        if response.status_code == 200:
+            result = response.json()
+            
+            # Extract the generated caption
+            description = ""
+            if isinstance(result, list) and len(result) > 0:
+                if "generated_text" in result[0]:
+                    description = result[0]["generated_text"]
+            elif isinstance(result, dict) and "generated_text" in result:
+                description = result["generated_text"]
+            
+            if not description:
+                description = "I can see an image, but I'm having trouble analyzing it in detail right now."
+            
+            # Create a response that combines the description with the user's question
+            response_text = f"**Image Analysis:**\n\n{description}\n\n**Regarding your question \"{req.question}\":**\n\nBased on what I can see in the image: {description}"
+            
+            return {
+                "description": description,
+                "response": response_text,
+                "success": True
+            }
+        else:
+            # Model might be loading (first request takes 20-30 seconds)
+            error_msg = "The image analysis service is starting up (takes 20-30 seconds on first use). Please try again in a moment!"
+            return {
+                "description": error_msg,
+                "response": error_msg,
+                "success": False
+            }
+            
+    except Exception as e:
+        print(f"Image analysis error: {str(e)}")
+        error_msg = f"I can see you've uploaded an image, but I'm having trouble analyzing it right now. Please try again! Error: {str(e)[:100]}"
+        return {
+            "description": error_msg,
+            "response": error_msg,
+            "success": False
+        }
 
 @app.post("/chat")
 def chat(req: ChatRequest):
