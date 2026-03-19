@@ -1,9 +1,4 @@
-import zipfile, os
-
-base = "/mnt/data/zippy_working"
-os.makedirs(base, exist_ok=True)
-
-backend = """from fastapi import FastAPI
+from fastapi import FastAPI
 from fastapi.middleware.cors import CORSMiddleware
 from pydantic import BaseModel
 from groq import Groq
@@ -20,82 +15,45 @@ app.add_middleware(
     allow_headers=["*"],
 )
 
-client = Groq(api_key=os.environ.get("GROQ_API_KEY",""))
+client = Groq(api_key=os.environ.get("GROQ_API_KEY", ""))
 
 class Req(BaseModel):
     message: str
 
 def generate_image(prompt):
-    return "https://image.pollinations.ai/prompt/" + quote(prompt)
+    # Pollinations AI endpoint - encode the prompt properly
+    encoded_prompt = quote(prompt)
+    return f"https://image.pollinations.ai/prompt/{encoded_prompt}?width=512&height=512&nologo=true"
 
 @app.post("/chat")
 def chat(req: Req):
     msg = req.message.strip()
+    
+    try:
+        # Get AI response
+        res = client.chat.completions.create(
+            model="llama-3.3-70b-versatile",
+            messages=[
+                {"role": "system", "content": "You are Zippy AI, a helpful assistant. When users ask you to generate images, describe what you'll create in detail."},
+                {"role": "user", "content": msg}
+            ],
+            max_tokens=500
+        )
+        reply = res.choices[0].message.content
+        
+        # Check if user wants an image
+        image_keywords = ["draw", "image", "generate", "show", "picture", "create", "sketch", "paint"]
+        wants_image = any(keyword in msg.lower() for keyword in image_keywords)
+        
+        if wants_image:
+            image_url = generate_image(msg)
+            return {"reply": reply, "image": image_url}
+        
+        return {"reply": reply}
+    
+    except Exception as e:
+        return {"reply": f"Error: {str(e)}", "error": True}
 
-    res = client.chat.completions.create(
-        model="llama-3.3-70b-versatile",
-        messages=[
-            {"role":"system","content":"You are Zippy AI."},
-            {"role":"user","content":msg}
-        ]
-    )
-
-    reply = res.choices[0].message.content
-
-    if any(k in msg.lower() for k in ["draw","image","generate","show","picture"]):
-        return {"reply": reply, "image": generate_image(msg)}
-
-    return {"reply": reply}
-"""
-
-frontend = """<!DOCTYPE html>
-<html>
-<head>
-<title>Zippy</title>
-</head>
-<body>
-
-<h2>Zippy AI</h2>
-
-<input id="inp">
-<button onclick="send()">Send</button>
-
-<p id="out"></p>
-<img id="img" width="400"/>
-
-<script>
-async function send(){
- let text=document.getElementById("inp").value;
- let res=await fetch("http://127.0.0.1:8000/chat",{
-  method:"POST",
-  headers:{"Content-Type":"application/json"},
-  body:JSON.stringify({message:text})
- });
-
- let data=await res.json();
-
- document.getElementById("out").innerText=data.reply;
-
- if(data.image){
-  let img=document.getElementById("img");
-  img.src=data.image;
- }
-}
-</script>
-
-</body>
-</html>
-"""
-
-with open(base+"/main.py","w") as f:
-    f.write(backend)
-
-with open(base+"/index.html","w") as f:
-    f.write(frontend)
-
-zip_path="/mnt/data/zippy_working.zip"
-with zipfile.ZipFile(zip_path,'w') as z:
-    z.write(base+"/main.py","main.py")
-    z.write(base+"/index.html","index.html")
-
-zip_path
+@app.get("/")
+def root():
+    return {"status": "Zippy AI is running"}
