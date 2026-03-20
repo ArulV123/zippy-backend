@@ -8,6 +8,7 @@ import re
 import json
 import time
 import math
+import threading
 
 app = FastAPI()
 client = Groq(api_key=os.environ["GROQ_API_KEY"])
@@ -23,13 +24,14 @@ app.add_middleware(
 #  MODELS
 # ─────────────────────────────────────────────────────────────────────
 CHAT_MODELS = [
-    {"id": "llama-3.3-70b-versatile", "name": "Llama 3.3 70B",  "ctx": 128_000},
-    {"id": "llama-3.1-8b-instant",    "name": "Llama 3.1 8B",   "ctx": 128_000},
-    {"id": "gemma2-9b-it",            "name": "Gemma 2 9B",     "ctx":   8_192},
-    {"id": "llama3-70b-8192",         "name": "Llama 3 70B",    "ctx":   8_192},
-    {"id": "llama3-8b-8192",          "name": "Llama 3 8B",     "ctx":   8_192},
+    {"id": "llama-3.3-70b-versatile", "name": "Llama 3.3 70B"},
+    {"id": "llama-3.1-8b-instant",    "name": "Llama 3.1 8B"},
+    {"id": "gemma2-9b-it",            "name": "Gemma 2 9B"},
+    {"id": "llama3-70b-8192",         "name": "Llama 3 70B"},
+    {"id": "llama3-8b-8192",          "name": "Llama 3 8B"},
 ]
 
+# Fastest models first — thinking step must be quick
 THINK_MODELS = [
     {"id": "llama-3.1-8b-instant",    "name": "Llama 3.1 8B"},
     {"id": "gemma2-9b-it",            "name": "Gemma 2 9B"},
@@ -55,26 +57,22 @@ def parse_retry_after(exc: Exception) -> float:
     try:
         msg = str(exc)
         m = re.search(r'(?:try again in|retry after)\s*([\d.]+)s', msg, re.IGNORECASE)
-        if m:
-            return float(m.group(1)) + 2
+        if m: return float(m.group(1)) + 2
         m = re.search(r'(\d+)m(\d+)s', msg)
-        if m:
-            return int(m.group(1)) * 60 + int(m.group(2)) + 2
+        if m: return int(m.group(1)) * 60 + int(m.group(2)) + 2
         m = re.search(r'(\d+)m', msg)
-        if m:
-            return int(m.group(1)) * 60 + 2
+        if m: return int(m.group(1)) * 60 + 2
     except Exception:
         pass
     return 62.0
 
 def earliest_available_in(models: list[dict]) -> float:
     now = time.time()
-    waits = [max(0.0, model_cooldown.get(m["id"], 0) - now) for m in models]
-    return min(waits) if waits else 0.0
+    return min((max(0.0, model_cooldown.get(m["id"], 0) - now) for m in models), default=0.0)
 
 def format_wait(seconds: float) -> str:
-    if seconds < 5:    return "a few seconds"
-    if seconds < 90:   return f"{math.ceil(seconds)} seconds"
+    if seconds < 5:  return "a few seconds"
+    if seconds < 90: return f"{math.ceil(seconds)} seconds"
     minutes = math.ceil(seconds / 60)
     return f"{minutes} minute{'s' if minutes != 1 else ''}"
 
@@ -90,7 +88,6 @@ def call_with_fallback(
     top_p: float = 0.9,
 ) -> tuple[str, str]:
     tried: list[str] = []
-
     for model in models:
         mid = model["id"]
         if not is_available(mid):
@@ -118,74 +115,189 @@ def call_with_fallback(
         except Exception as e:
             tried.append(f"{model['name']} — {type(e).__name__}")
             print(f"[error] {mid} → {e}")
-
     soonest = earliest_available_in(models)
     raise RuntimeError(f"QUOTA_EXCEEDED|{format_wait(soonest)}|{'||'.join(tried)}")
 
 
 # ─────────────────────────────────────────────────────────────────────
-#  SEARCH LAYER
-#  Strategy: use only APIs that return actual content — no HTML scraping.
-#  Every source below returns real text that gets injected into the AI.
+#  THINKING STEP  —  model decides, with a hard timeout + rule fallback
 #
-#  Sources:
-#   1. Wikipedia Search API  → finds the right article + returns FULL extract
-#   2. CoinGecko API         → live crypto prices (no key needed)
-#   3. wttr.in               → live weather (no key needed)
-#   4. Open-Meteo geocoding  → location lookup for weather fallback
-#   5. REST Countries API    → country facts (no key needed)
-#   6. Numbers/date facts    → fun facts via numbersapi.com
-#
-#  ALL of these are free, stable, and return real structured data.
-#  NO HTML scraping — server IPs get blocked.
+#  The AI model is ALWAYS asked first.
+#  Rules only activate if the model times out or returns broken JSON.
+#  This ensures the AI "thinks for itself" on every healthy request.
 # ─────────────────────────────────────────────────────────────────────
 
-BASE_HEADERS = {"User-Agent": "ZippyAI/2.0 (educational chatbot)"}
+THINK_PROMPT = """You are the thinking engine for Zippy AI.
 
-# ── 1. Wikipedia: search → get full article extract ──────────────────
+A user sent a message. Your ONLY job is to decide:
+1. Does answering this need live/current information from the web?
+2. If yes, what is the best short search query to use?
 
+Respond with ONLY a raw JSON object. No markdown, no extra text, just JSON.
+
+{
+  "needs_search": true or false,
+  "search_query": "search query here, or empty string if not needed",
+  "reasoning": "one sentence explaining your decision"
+}
+
+Think carefully:
+
+NEEDS SEARCH — YES, when the question is about:
+- Current prices of anything: crypto, stocks, gold, oil, forex, petrol
+- Live weather or forecast for a location
+- Recent or ongoing events, news, match results, scores
+- Anything described with: today, now, current, latest, recent, live, 2024, 2025, 2026
+- Who holds a position RIGHT NOW (president, CEO, champion, etc.)
+- New product releases, software versions, app updates
+- Country facts like capital, population, currency (these can change)
+
+NEEDS SEARCH — NO, when the question is about:
+- Coding concepts, algorithms, syntax, how to write something in code
+- Maths problems or calculations
+- Science theory (gravity, photosynthesis, etc.)
+- History before 2023
+- Definitions or explanations of stable concepts
+- Creative writing: poems, stories, essays
+- Grammar, translation, language
+- General advice or opinions
+- Greetings or small talk
+
+For search_query: make it short, specific, search-engine optimised.
+Example: "bitcoin price today", "weather in Chennai", "IPL 2025 winner"
+
+Output only the JSON. Nothing else."""
+
+
+# Minimal keyword rules — ONLY used when the model call fails completely
+_ALWAYS_SEARCH = re.compile(
+    r'\b(price|cost|weather|temperature|forecast|score|result|winner|'
+    r'bitcoin|ethereum|crypto|stock|gold|silver|oil|petrol|forex|'
+    r'today|right now|currently|latest|breaking news|live score)\b',
+    re.IGNORECASE,
+)
+
+def _rule_fallback(user_input: str) -> dict:
+    """
+    Emergency keyword fallback — only runs when the model times out or crashes.
+    Not the primary decision maker — just a safety net.
+    """
+    if _ALWAYS_SEARCH.search(user_input):
+        q = user_input.strip().rstrip("?").strip()
+        return {
+            "needs_search": True,
+            "search_query": q,
+            "reasoning": "Rule fallback: time-sensitive keyword detected (model timed out).",
+        }
+    return {
+        "needs_search": False,
+        "search_query": "",
+        "reasoning": "Rule fallback: no time-sensitive keywords (model timed out).",
+    }
+
+
+def run_thinking(user_input: str, timeout_seconds: float = 5.0) -> dict:
+    """
+    Ask the AI model to decide if search is needed.
+
+    Uses a background thread with a hard deadline so a cold/slow model
+    never blocks the main request. If the model responds in time → use it.
+    If it times out or returns bad JSON → silently use rule fallback.
+
+    This way:
+    - First request (cold start): model may time out → rules handle it instantly
+    - All subsequent requests: model warms up and handles it correctly
+    - The AI's own judgment is used on every healthy request
+    """
+    result_holder: list[dict] = []
+    error_holder:  list[str]  = []
+
+    def _call():
+        think_messages = [
+            {"role": "system", "content": THINK_PROMPT},
+            {"role": "user",   "content": user_input},
+        ]
+        try:
+            raw, used_model = call_with_fallback(
+                think_messages,
+                THINK_MODELS,
+                max_tokens=120,
+                temperature=0.0,   # deterministic — we want consistent JSON
+                top_p=1.0,
+            )
+            # Strip markdown fences if model adds them despite instructions
+            raw = re.sub(r"```(?:json)?|```", "", raw).strip()
+            # Extract first valid JSON object
+            m = re.search(r'\{.*?\}', raw, re.DOTALL)
+            if m:
+                raw = m.group(0)
+            parsed = json.loads(raw)
+            if "needs_search" not in parsed:
+                raise ValueError("Missing needs_search key")
+            parsed["_model"] = used_model
+            result_holder.append(parsed)
+            print(f"[thinking] ✓ model={used_model} needs_search={parsed['needs_search']} "
+                  f"query='{parsed.get('search_query', '')}'")
+        except RuntimeError as e:
+            # All models rate-limited — just record it
+            error_holder.append(f"quota: {e}")
+        except Exception as e:
+            error_holder.append(f"{type(e).__name__}: {e}")
+
+    # Run model call in a thread with a deadline
+    thread = threading.Thread(target=_call, daemon=True)
+    thread.start()
+    thread.join(timeout=timeout_seconds)
+
+    if result_holder:
+        # Model responded in time — use its judgment
+        return result_holder[0]
+
+    # Model timed out or failed — log it and use rules
+    if thread.is_alive():
+        print(f"[thinking] ⏱ model timed out after {timeout_seconds}s → using rule fallback")
+    else:
+        print(f"[thinking] ✗ model failed ({error_holder}) → using rule fallback")
+
+    return _rule_fallback(user_input)
+
+
+# ─────────────────────────────────────────────────────────────────────
+#  SEARCH SOURCES  (all free, no API keys, no HTML scraping)
+# ─────────────────────────────────────────────────────────────────────
+BASE_HEADERS = {"User-Agent": "ZippyAI/2.0 (educational project)"}
+
+# ── Wikipedia: search API + full article extract ──────────────────────
 def _wiki_search_title(query: str) -> str | None:
-    """Find the best matching Wikipedia article title for a query."""
     try:
         r = requests.get(
             "https://en.wikipedia.org/w/api.php",
             params={
-                "action":  "query",
-                "list":    "search",
-                "srsearch": query,
-                "srlimit": 1,
-                "format":  "json",
-                "origin":  "*",
+                "action": "query", "list": "search",
+                "srsearch": query, "srlimit": 1,
+                "format": "json", "origin": "*",
             },
-            headers=BASE_HEADERS,
-            timeout=7,
+            headers=BASE_HEADERS, timeout=7,
         )
         r.raise_for_status()
         results = r.json().get("query", {}).get("search", [])
         if results:
             return results[0]["title"]
     except Exception as e:
-        print(f"[wiki-search] {e}")
+        print(f"[wiki-title] {e}")
     return None
 
-
 def _wiki_fetch_extract(title: str, chars: int = 3000) -> str:
-    """Fetch the full extract text of a Wikipedia article by title."""
     try:
         r = requests.get(
             "https://en.wikipedia.org/w/api.php",
             params={
-                "action":    "query",
-                "prop":      "extracts",
-                "exintro":   False,       # get more than just intro
-                "explaintext": True,      # plain text, no HTML
-                "titles":    title,
-                "format":    "json",
-                "origin":    "*",
-                "exchars":   chars,       # how many characters to return
+                "action": "query", "prop": "extracts",
+                "exintro": False, "explaintext": True,
+                "titles": title, "format": "json",
+                "origin": "*", "exchars": chars,
             },
-            headers=BASE_HEADERS,
-            timeout=8,
+            headers=BASE_HEADERS, timeout=8,
         )
         r.raise_for_status()
         pages = r.json().get("query", {}).get("pages", {})
@@ -194,51 +306,36 @@ def _wiki_fetch_extract(title: str, chars: int = 3000) -> str:
             if extract and len(extract) > 50:
                 return extract
     except Exception as e:
-        print(f"[wiki-fetch] {e}")
+        print(f"[wiki-extract] {e}")
     return ""
 
-
 def search_wikipedia(query: str) -> dict | None:
-    """
-    Full Wikipedia pipeline:
-    1. Search for best matching article
-    2. Fetch up to 3000 chars of its content
-    Returns dict with title, url, content — or None if nothing found.
-    """
     title = _wiki_search_title(query)
     if not title:
         return None
-
     content = _wiki_fetch_extract(title, chars=3000)
     if not content:
         return None
-
     url = f"https://en.wikipedia.org/wiki/{requests.utils.quote(title.replace(' ', '_'))}"
     print(f"[wiki] ✓ '{title}' ({len(content)} chars)")
-    return {
-        "source":  "Wikipedia",
-        "title":   title,
-        "url":     url,
-        "content": content,
-    }
+    return {"source": "Wikipedia", "title": title, "url": url, "content": content}
 
 
-# ── 2. Crypto prices via CoinGecko ───────────────────────────────────
-
+# ── CoinGecko: live crypto prices ─────────────────────────────────────
 CRYPTO_MAP = {
-    "bitcoin": "bitcoin",   "btc":  "bitcoin",
-    "ethereum": "ethereum", "eth":  "ethereum",
-    "dogecoin": "dogecoin", "doge": "dogecoin",
-    "solana":   "solana",   "sol":  "solana",
-    "bnb": "binancecoin",   "binance coin": "binancecoin",
-    "xrp": "ripple",        "ripple": "ripple",
-    "cardano": "cardano",   "ada":  "cardano",
-    "litecoin": "litecoin", "ltc":  "litecoin",
-    "polkadot": "polkadot", "dot":  "polkadot",
-    "shib": "shiba-inu",    "shiba inu": "shiba-inu",
-    "tron": "tron",         "trx":  "tron",
-    "avax": "avalanche-2",  "avalanche": "avalanche-2",
-    "matic": "matic-network", "polygon": "matic-network",
+    "bitcoin": "bitcoin",      "btc":  "bitcoin",
+    "ethereum": "ethereum",    "eth":  "ethereum",
+    "dogecoin": "dogecoin",    "doge": "dogecoin",
+    "solana": "solana",        "sol":  "solana",
+    "bnb": "binancecoin",      "binance": "binancecoin",
+    "xrp": "ripple",           "ripple": "ripple",
+    "cardano": "cardano",      "ada":  "cardano",
+    "litecoin": "litecoin",    "ltc":  "litecoin",
+    "polkadot": "polkadot",    "dot":  "polkadot",
+    "shib": "shiba-inu",       "shiba": "shiba-inu",
+    "tron": "tron",            "trx":  "tron",
+    "avax": "avalanche-2",     "avalanche": "avalanche-2",
+    "matic": "matic-network",  "polygon": "matic-network",
 }
 
 def _detect_crypto(q: str) -> list[str]:
@@ -259,67 +356,45 @@ def search_crypto(query: str) -> dict | None:
                 "include_market_cap":  "true",
                 "include_24hr_vol":    "true",
             },
-            headers=BASE_HEADERS,
-            timeout=8,
+            headers=BASE_HEADERS, timeout=8,
         )
         r.raise_for_status()
         data = r.json()
-
         lines = []
         for coin_id, info in data.items():
-            usd    = info.get("usd",              "N/A")
-            inr    = info.get("inr",              "N/A")
-            chg    = info.get("usd_24h_change",   None)
-            mcap   = info.get("usd_market_cap",   None)
-            vol    = info.get("usd_24h_vol",      None)
-
-            chg_str  = f"{chg:+.2f}%" if chg  is not None else "N/A"
-            mcap_str = f"${mcap:,.0f}" if mcap is not None else "N/A"
-            vol_str  = f"${vol:,.0f}"  if vol  is not None else "N/A"
-            usd_str  = f"${usd:,.2f}"  if isinstance(usd, (int, float)) else str(usd)
-            inr_str  = f"₹{inr:,.2f}"  if isinstance(inr, (int, float)) else str(inr)
-
+            usd  = info.get("usd", "N/A")
+            inr  = info.get("inr", "N/A")
+            chg  = info.get("usd_24h_change", None)
+            mcap = info.get("usd_market_cap", None)
+            vol  = info.get("usd_24h_vol",    None)
             lines.append(
                 f"{coin_id.capitalize()}:\n"
-                f"  Price (USD): {usd_str}\n"
-                f"  Price (INR): {inr_str}\n"
-                f"  24h Change:  {chg_str}\n"
-                f"  Market Cap:  {mcap_str}\n"
-                f"  24h Volume:  {vol_str}"
+                f"  Price:      ${usd:,.2f} USD  /  ₹{inr:,.2f} INR\n"
+                f"  24h Change: {f'{chg:+.2f}%' if chg is not None else 'N/A'}\n"
+                f"  Market Cap: {f'${mcap:,.0f}' if mcap else 'N/A'}\n"
+                f"  24h Volume: {f'${vol:,.0f}'  if vol  else 'N/A'}"
             )
-
-        content = "\n\n".join(lines)
         print(f"[crypto] ✓ {coins}")
         return {
             "source":  "CoinGecko (live)",
             "title":   "Live Cryptocurrency Prices",
             "url":     "https://www.coingecko.com",
-            "content": content,
+            "content": "\n\n".join(lines),
         }
     except Exception as e:
         print(f"[crypto] failed: {e}")
         return None
 
 
-# ── 3. Weather via wttr.in ────────────────────────────────────────────
-
-WEATHER_WORDS = {
-    "weather", "temperature", "forecast", "humidity",
-    "rain", "sunny", "hot", "cold", "wind", "climate",
-}
-
+# ── wttr.in: live weather ─────────────────────────────────────────────
 def _detect_city(query: str) -> str | None:
     q = query.lower()
-    if not any(w in q for w in WEATHER_WORDS):
+    if not any(w in q for w in {"weather", "temperature", "forecast", "humidity", "rain", "wind"}):
         return None
-    # "weather in Chennai" / "weather of London"
-    m = re.search(r'weather\s+(?:in|at|for|of)?\s*([A-Za-z\s]{2,25})', query, re.IGNORECASE)
-    if m:
-        return m.group(1).strip()
-    # "Chennai weather"
-    m = re.search(r'([A-Za-z\s]{2,25})\s+weather', query, re.IGNORECASE)
-    if m:
-        return m.group(1).strip()
+    m = re.search(r'weather\s+(?:in|at|for|of)?\s*([A-Za-z][A-Za-z\s]{1,24})', query, re.IGNORECASE)
+    if m: return m.group(1).strip()
+    m = re.search(r'([A-Za-z][A-Za-z\s]{1,24})\s+weather', query, re.IGNORECASE)
+    if m: return m.group(1).strip()
     return None
 
 def search_weather(query: str) -> dict | None:
@@ -336,35 +411,29 @@ def search_weather(query: str) -> dict | None:
         r.raise_for_status()
         d   = r.json()
         cur = d["current_condition"][0]
-
-        desc    = cur.get("weatherDesc",  [{}])[0].get("value", "N/A")
-        temp_c  = cur.get("temp_C",       "N/A")
-        temp_f  = cur.get("temp_F",       "N/A")
-        feels_c = cur.get("FeelsLikeC",   "N/A")
-        humidity= cur.get("humidity",     "N/A")
-        wind    = cur.get("windspeedKmph","N/A")
-        vis     = cur.get("visibility",   "N/A")
-        uv      = cur.get("uvIndex",      "N/A")
-
-        # 3-day forecast
-        forecast_lines = []
+        desc     = cur.get("weatherDesc",   [{}])[0].get("value", "N/A")
+        temp_c   = cur.get("temp_C",        "N/A")
+        temp_f   = cur.get("temp_F",        "N/A")
+        feels    = cur.get("FeelsLikeC",    "N/A")
+        humidity = cur.get("humidity",      "N/A")
+        wind     = cur.get("windspeedKmph", "N/A")
+        uv       = cur.get("uvIndex",       "N/A")
+        forecast = []
         for day in d.get("weather", [])[:3]:
-            date    = day.get("date",       "")
-            max_c   = day.get("maxtempC",   "N/A")
-            min_c   = day.get("mintempC",   "N/A")
-            desc_d  = day.get("hourly",     [{}])[4].get("weatherDesc", [{}])[0].get("value", "N/A")
-            forecast_lines.append(f"  {date}: {desc_d}, {min_c}°C – {max_c}°C")
-
+            date  = day.get("date", "")
+            maxc  = day.get("maxtempC", "N/A")
+            minc  = day.get("mintempC", "N/A")
+            desc2 = (day.get("hourly") or [{}])[4].get("weatherDesc", [{}])[0].get("value", "N/A")
+            forecast.append(f"  {date}: {desc2}, {minc}°C – {maxc}°C")
         content = (
             f"Current weather in {city}:\n"
             f"  Condition:   {desc}\n"
             f"  Temperature: {temp_c}°C ({temp_f}°F)\n"
-            f"  Feels like:  {feels_c}°C\n"
+            f"  Feels like:  {feels}°C\n"
             f"  Humidity:    {humidity}%\n"
-            f"  Wind speed:  {wind} km/h\n"
-            f"  Visibility:  {vis} km\n"
+            f"  Wind:        {wind} km/h\n"
             f"  UV Index:    {uv}\n\n"
-            f"3-Day Forecast:\n" + "\n".join(forecast_lines)
+            f"3-Day Forecast:\n" + "\n".join(forecast)
         )
         print(f"[weather] ✓ {city}")
         return {
@@ -378,71 +447,58 @@ def search_weather(query: str) -> dict | None:
         return None
 
 
-# ── 4. REST Countries API ─────────────────────────────────────────────
-
-COUNTRY_WORDS = {
-    "country", "capital", "population", "currency", "language",
-    "continent", "flag", "area", "gdp", "nation",
-}
-
-def _detect_country_query(query: str) -> bool:
-    return any(w in query.lower() for w in COUNTRY_WORDS)
+# ── REST Countries API ────────────────────────────────────────────────
+def _detect_country(query: str) -> str | None:
+    if not any(w in query.lower() for w in
+               {"capital", "population", "currency", "language", "continent", "area", "country", "nation"}):
+        return None
+    m = re.search(
+        r'(?:of|in|about|for|capital of|population of|currency of|area of)\s+'
+        r'([A-Z][a-z]+(?:\s[A-Z][a-z]+)?)', query
+    )
+    if m: return m.group(1).strip()
+    m = re.search(r'\b([A-Z][a-z]{3,})\b', query)
+    if m: return m.group(1).strip()
+    return None
 
 def search_country(query: str) -> dict | None:
-    if not _detect_country_query(query):
+    name = _detect_country(query)
+    if not name:
         return None
-    # Extract a country name: take words that are capitalised or after "of/in/about"
-    m = re.search(
-        r'(?:of|in|about|for|country|capital of|population of)\s+([A-Z][a-z]+(?:\s+[A-Z][a-z]+)?)',
-        query
-    )
-    if not m:
-        # Try first capitalised word as country name
-        m = re.search(r'\b([A-Z][a-z]{2,})\b', query)
-    if not m:
-        return None
-    country_name = m.group(1).strip()
-
     try:
         r = requests.get(
-            f"https://restcountries.com/v3.1/name/{requests.utils.quote(country_name)}",
-            params={"fullText": "false"},
-            headers=BASE_HEADERS,
-            timeout=7,
+            f"https://restcountries.com/v3.1/name/{requests.utils.quote(name)}",
+            headers=BASE_HEADERS, timeout=7,
         )
         r.raise_for_status()
         data = r.json()
         if not data or isinstance(data, dict):
             return None
         c = data[0]
-
-        name       = c.get("name", {}).get("common", country_name)
-        capital    = ", ".join(c.get("capital", ["N/A"]))
-        population = c.get("population", "N/A")
-        region     = c.get("region", "N/A")
-        subregion  = c.get("subregion", "N/A")
-        area       = c.get("area", "N/A")
+        common    = c.get("name", {}).get("common", name)
+        capital   = ", ".join(c.get("capital", ["N/A"]))
+        pop       = c.get("population", "N/A")
+        region    = c.get("region", "N/A")
+        subregion = c.get("subregion", "N/A")
+        area      = c.get("area", "N/A")
         currencies = ", ".join(
             f"{v.get('name','')} ({v.get('symbol','')})"
             for v in c.get("currencies", {}).values()
         ) or "N/A"
-        languages  = ", ".join(c.get("languages", {}).values()) or "N/A"
-        timezones  = ", ".join(c.get("timezones", [])[:3])
-
+        languages = ", ".join(c.get("languages", {}).values()) or "N/A"
         content = (
-            f"Country: {name}\n"
+            f"Country: {common}\n"
             f"  Capital:    {capital}\n"
-            f"  Population: {population:,}\n"
+            f"  Population: {pop:,}\n"
             f"  Region:     {region} ({subregion})\n"
             f"  Area:       {area} km²\n"
             f"  Currencies: {currencies}\n"
-            f"  Languages:  {languages}\n"
-            f"  Timezones:  {timezones}"
+            f"  Languages:  {languages}"
         )
-        print(f"[country] ✓ {name}")
+        print(f"[country] ✓ {common}")
         return {
-            "source":  "REST Countries API",
-            "title":   f"Country Data: {name}",
+            "source":  "REST Countries",
+            "title":   f"Country: {common}",
             "url":     "https://restcountries.com",
             "content": content,
         }
@@ -451,113 +507,74 @@ def search_country(query: str) -> dict | None:
         return None
 
 
-# ── Master search orchestrator ────────────────────────────────────────
-
-# Keywords that indicate a need for current/live information
-SEARCH_KEYWORDS = [
-    "price", "cost", "worth", "value", "rate", "how much",
-    "bitcoin", "ethereum", "crypto", "stock", "share", "market",
-    "weather", "temperature", "forecast", "rain",
-    "score", "result", "winner", "won", "beat", "champion",
-    "latest", "recent", "current", "today", "now", "live",
-    "this week", "this month", "this year", "2024", "2025", "2026",
-    "news", "update", "announce", "release", "launch",
-    "who is", "who's", "who won", "who leads",
-    "ipl", "cricket", "football", "nba", "nfl", "match", "tournament",
-    "capital", "population", "country", "currency",
-    "what happened", "breaking",
-]
-
-def needs_search_by_keyword(query: str) -> bool:
-    lower = query.lower()
-    return any(kw in lower for kw in SEARCH_KEYWORDS)
-
-
+# ── Master search runner ──────────────────────────────────────────────
 def run_search(query: str) -> list[dict]:
-    """
-    Run all relevant search sources for the query.
-    Returns list of source dicts, each with: source, title, url, content.
-    Content is FULL text — not a snippet — so the AI has real data to answer from.
-    """
     results: list[dict] = []
+    seen: set[str] = set()
 
-    # Crypto prices — highest priority for price queries
-    c = search_crypto(query)
-    if c:
-        results.append(c)
+    def add(item: dict | None):
+        if not item:
+            return
+        key = item.get("url") or item.get("title", "")
+        if key not in seen:
+            seen.add(key)
+            results.append(item)
 
-    # Weather — if location + weather word detected
-    w = search_weather(query)
-    if w:
-        results.append(w)
+    add(search_crypto(query))
+    add(search_weather(query))
+    add(search_country(query))
+    add(search_wikipedia(query))
 
-    # Country facts
-    co = search_country(query)
-    if co:
-        results.append(co)
-
-    # Wikipedia — always try, it's the most reliable free text source
-    wiki = search_wikipedia(query)
-    if wiki:
-        results.append(wiki)
-
-    print(f"[search] total sources collected: {len(results)}")
+    print(f"[search] total sources: {len(results)}")
     return results
 
 
 def build_search_context(query: str, results: list[dict]) -> str:
-    """
-    Build the context block that gets injected directly into the AI prompt.
-    Uses clear delimiters so the model knows exactly what is live data.
-    """
-    now_str = time.strftime("%Y-%m-%d %H:%M UTC", time.gmtime())
-
+    now_str = time.strftime("%d %b %Y %H:%M UTC", time.gmtime())
     if not results:
         return (
-            f"<search_results>\n"
-            f"SEARCH ATTEMPTED: '{query}'\n"
-            f"RESULT: No data found from any source.\n"
-            f"INSTRUCTION: Tell the user you searched but couldn't find current data. "
-            f"Do NOT say 'I don't have real-time access' — you searched and found nothing.\n"
-            f"</search_results>"
+            "<search_results>\n"
+            f"SEARCHED FOR: {query}\n"
+            f"RETRIEVED AT: {now_str}\n"
+            "RESULT: No data found from any source.\n"
+            "INSTRUCTION: Tell the user you searched but found no current data. "
+            "Do NOT say 'I don't have real-time access'.\n"
+            "</search_results>"
         )
 
-    parts = [
-        f"<search_results>",
-        f"QUERY: {query}",
-        f"RETRIEVED: {now_str}",
-        f"SOURCES: {len(results)} found",
+    lines = [
+        "<search_results>",
+        f"SEARCHED FOR: {query}",
+        f"RETRIEVED AT: {now_str}",
+        f"SOURCES FOUND: {len(results)}",
         "",
-        "=" * 60,
     ]
-
     for i, r in enumerate(results, 1):
-        parts += [
-            f"",
-            f"SOURCE {i}: {r['source']}",
-            f"TITLE:  {r['title']}",
-            f"URL:    {r['url']}",
-            f"",
-            f"CONTENT:",
-            r['content'],
+        lines += [
+            f"--- SOURCE {i}: {r['source']} ---",
+            f"Title: {r['title']}",
+            f"URL:   {r['url']}",
             "",
-            "-" * 40,
+            r["content"],
+            "",
         ]
-
-    parts += [
+    lines += [
+        "--- END OF SEARCH RESULTS ---",
         "",
-        "INSTRUCTION: The above is REAL, LIVE data retrieved right now.",
-        "Use it directly to answer the user's question.",
-        "Do NOT say you lack real-time access — you have the data above.",
-        "Answer based ONLY on what is shown above. Be specific and accurate.",
+        "INSTRUCTIONS FOR AI:",
+        "- This data is REAL and was fetched live moments ago.",
+        "- Use the exact numbers and facts above in your answer.",
+        "- NEVER say 'I don't have real-time access' or 'my training data'.",
+        "- NEVER say 'I cannot provide current prices' — the data is above.",
+        "- Cite the source naturally: 'According to CoinGecko...' etc.",
+        "- If the data doesn't answer the question, say you searched but found nothing relevant.",
         "</search_results>",
     ]
-
-    return "\n".join(parts)
+    return "\n".join(lines)
 
 
 # ─────────────────────────────────────────────────────────────────────
-#  IMAGE DETECTION + DECLINE
+#  IMAGE DETECTION
 # ─────────────────────────────────────────────────────────────────────
 IMAGE_GEN_RE = re.compile(
     r'\b(generate|create|make|draw|paint|design|produce|render)\b.{0,25}'
@@ -579,120 +596,41 @@ IMAGE_DECLINE = (
     "Want me to write a detailed prompt for any of these? ✍️"
 )
 
-
 # ─────────────────────────────────────────────────────────────────────
 #  SYSTEM PROMPT
 # ─────────────────────────────────────────────────────────────────────
 SYSTEM = """You are Zippy, a smart AI assistant made by Arul Vethathiri.
 
 ## IDENTITY
-- Text-only AI. You cannot generate images.
+- Text-only AI. You cannot generate images. Period.
 - Made by Arul Vethathiri, Class 11 student (2026).
 
-## CRITICAL: HOW TO USE SEARCH RESULTS
-When you see a <search_results> block in the conversation:
-- That data is REAL and was fetched live just now.
-- Read it carefully and use the actual numbers/facts in your answer.
-- NEVER say "I don't have real-time access" or "my training data" — you have live data.
-- NEVER say "I cannot provide current prices" — the price is right there in the data.
-- Answer using the exact figures from the search results.
-- Mention the source naturally (e.g. "According to CoinGecko..." or "The current price is...").
-- If search found nothing, say "I searched but couldn't find current data on that."
+## CRITICAL — HOW TO USE SEARCH RESULTS
+When you see a <search_results> block:
+- That data is REAL and was fetched live moments ago.
+- READ it carefully and use the actual numbers and facts in your answer.
+- NEVER say "I don't have real-time access" or "my training data is limited".
+- NEVER say "I cannot provide current prices" — the price is in the data above.
+- Answer using the exact figures. Cite the source naturally.
+- If search found nothing useful, say "I searched but couldn't find current data on that."
 
 ## TONE
-- Smart, calm, friendly. Like a knowledgeable friend.
+- Smart, calm, friendly — like a knowledgeable friend.
 - Conversational, not corporate. Not over-excited.
 - Greetings: one short sentence.
 
 ## RESPONSE RULES
-1. Answer what was asked. Nothing more, nothing less.
-2. Numeric answers → give the number first, immediately.
+1. Answer EXACTLY what was asked. Nothing extra.
+2. Numbers/prices → state them immediately in the first sentence.
 3. Simple questions → 1-3 sentences.
 4. Explanations → short bullets, no long intro.
 5. Code → give it directly with brief comments.
-6. Math → show steps, keep brief.
+6. Math → show steps briefly.
 7. Creative → complete the full piece, no preamble.
 8. NEVER say: "Certainly!", "Great question!", "Of course!", "As an AI",
-   "I don't have real-time access", "my training data is limited",
-   "I cannot provide current prices", "I'd be happy to".
+   "I don't have real-time access", "my training data", "I'd be happy to".
 9. NEVER repeat the question.
-10. End every response with exactly 1 relevant emoji."""
-
-# ─────────────────────────────────────────────────────────────────────
-#  THINKING STEP
-# ─────────────────────────────────────────────────────────────────────
-THINK_PROMPT = """Decide if this user question needs a live web search.
-
-Output ONLY a JSON object. No markdown fences. No explanation. Just JSON.
-
-{
-  "needs_search": true or false,
-  "search_query": "short optimised search string, or empty string",
-  "reasoning": "one sentence"
-}
-
-ALWAYS search for:
-- Any price (crypto, stock, gold, currency, oil)
-- Sports scores, match results, tournament winners
-- Weather or temperature for a location  
-- "Latest", "recent", "current", "today", "now", "this week"
-- Who currently holds a job/position/title
-- New product releases or news events
-- Country facts (capital, population, currency)
-- Anything that changes over time
-
-NEVER search for:
-- How to code something
-- Math or science theory
-- History before 2023
-- Grammar, definitions, concepts
-- Creative writing, poems, stories
-- Opinions or general advice
-
-Good search_query examples:
-- "bitcoin price USD today"
-- "weather Chennai today"  
-- "IPL 2025 final winner"
-- "India capital population"
-
-JSON only:"""
-
-
-def run_thinking(user_input: str) -> dict:
-    messages = [
-        {"role": "system", "content": THINK_PROMPT},
-        {"role": "user",   "content": user_input},
-    ]
-    try:
-        raw, _ = call_with_fallback(
-            messages, THINK_MODELS,
-            max_tokens=100, temperature=0.0, top_p=1.0,
-        )
-        raw = re.sub(r"```(?:json)?|```", "", raw).strip()
-        m   = re.search(r'\{[^{}]+\}', raw, re.DOTALL)
-        if m:
-            raw = m.group(0)
-        result = json.loads(raw)
-        if "needs_search" in result:
-            return result
-    except RuntimeError:
-        pass
-    except Exception as e:
-        print(f"[thinking] parse failed: {e}")
-
-    # Keyword fallback — always reliable
-    if needs_search_by_keyword(user_input):
-        return {
-            "needs_search": True,
-            "search_query": user_input,
-            "reasoning":    "Keyword-based fallback: time-sensitive terms detected.",
-        }
-    return {
-        "needs_search": False,
-        "search_query": "",
-        "reasoning":    "No time-sensitive keywords found.",
-    }
-
+10. End with exactly 1 relevant emoji."""
 
 # ─────────────────────────────────────────────────────────────────────
 #  STATIC REPLIES
@@ -705,9 +643,9 @@ IDENTITY = {
     "who built you":     "Built by Arul Vethathiri. 👨‍💻",
     "what is your name": "I'm Zippy! 😊",
     "what can you do": (
-        "I can answer questions, help with code, explain things, do math, write content, "
-        "and search the web for live data like prices, weather, and news. "
-        "I can't generate images though. 💬"
+        "I can answer questions, help with code, explain concepts, do maths, "
+        "write content, and search the web for live data like prices, weather and news. "
+        "I can't generate images. 💬"
     ),
     "are you an ai":  "Yes — Zippy AI, made by Arul Vethathiri. 🤖",
     "are you human":  "Nope, I'm Zippy — an AI. A pretty capable one though! 😄",
@@ -726,14 +664,12 @@ SOCIAL = {
     "okay":       "Sure, let me know if you need anything. 👍",
 }
 
-
 # ─────────────────────────────────────────────────────────────────────
 #  REQUEST MODEL
 # ─────────────────────────────────────────────────────────────────────
 class ChatRequest(BaseModel):
     message: str
     history: list = []
-
 
 # ─────────────────────────────────────────────────────────────────────
 #  ROUTES
@@ -770,7 +706,7 @@ def chat(req: ChatRequest):
     if is_image_request(user_input):
         return {
             "reply":      IMAGE_DECLINE,
-            "thinking":   "Image generation request — text-only AI, declined.",
+            "thinking":   "Image generation request — text-only AI.",
             "searched":   False,
             "sources":    [],
             "model_used": "static",
@@ -778,26 +714,29 @@ def chat(req: ChatRequest):
 
     # 3. Static identity / social replies
     if text_lower in IDENTITY:
-        return {"reply": IDENTITY[text_lower], "thinking": "Identity — hardcoded.",
+        return {"reply": IDENTITY[text_lower], "thinking": "Identity.",
                 "searched": False, "sources": [], "model_used": "static"}
     if text_lower in SOCIAL:
-        return {"reply": SOCIAL[text_lower], "thinking": "Social — hardcoded.",
+        return {"reply": SOCIAL[text_lower], "thinking": "Social.",
                 "searched": False, "sources": [], "model_used": "static"}
 
-    # 4. Thinking step — decide if search needed + best query
-    think        = run_thinking(user_input)
+    # 4. Thinking step — AI model decides, with timeout + rule fallback safety net
+    think        = run_thinking(user_input, timeout_seconds=5.0)
     needs_search = think.get("needs_search", False)
-    search_query = think.get("search_query", "").strip() or user_input
+    search_query = (think.get("search_query") or "").strip() or user_input
     reasoning    = think.get("reasoning", "")
+    think_model  = think.get("_model", "fallback")
 
-    # 5. Search — always runs if needs_search, returns full content not snippets
+    print(f"[thinking] needs_search={needs_search} via={think_model} reasoning='{reasoning}'")
+
+    # 5. Run search if needed
     search_context = ""
     searched       = False
     search_sources: list[dict] = []
 
     if needs_search:
-        print(f"[search] query: '{search_query}'")
-        results = run_search(search_query)
+        print(f"[search] → '{search_query}'")
+        results        = run_search(search_query)
         search_context = build_search_context(search_query, results)
         if results:
             searched       = True
@@ -809,7 +748,6 @@ def chat(req: ChatRequest):
     # 6. Build messages for the AI
     messages: list[dict] = [{"role": "system", "content": SYSTEM}]
 
-    # Conversation history
     for h in req.history[-20:]:
         if isinstance(h, dict) and h.get("role") and h.get("content"):
             messages.append({
@@ -817,19 +755,17 @@ def chat(req: ChatRequest):
                 "content": str(h["content"])[:1500],
             })
 
-    # User turn: inject search context as part of the user message
-    # This placement (in user turn) is more reliable than a separate system injection
     if search_context:
         final_user = (
             f"{search_context}\n\n"
-            f"Based on the search results above, answer this:\n{user_input}"
+            f"Now answer this question using the data above:\n{user_input}"
         )
     else:
         final_user = user_input
 
     messages.append({"role": "user", "content": final_user})
 
-    # 7. Call AI with fallback chain
+    # 7. Call AI with full model fallback chain
     try:
         reply, model_used = call_with_fallback(
             messages, CHAT_MODELS,
@@ -848,7 +784,6 @@ def chat(req: ChatRequest):
         wait_str    = parts[1] if len(parts) == 3 else "a few minutes"
         tried_raw   = parts[2] if len(parts) == 3 else str(exc)
         tried_lines = "\n".join(f"• {l}" for l in tried_raw.split("||") if l.strip())
-
         return {
             "reply": (
                 f"⚠️ **All AI models are rate-limited right now.**\n\n"
