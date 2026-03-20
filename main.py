@@ -20,9 +20,7 @@ app.add_middleware(
 )
 
 # ─────────────────────────────────────────────────────────────────────
-#  MODEL ROSTER
-#  Each model has its own independent free-tier quota:
-#  30 RPM · 1,000 RPD · 6,000 TPM per model
+#  MODELS
 # ─────────────────────────────────────────────────────────────────────
 CHAT_MODELS = [
     {"id": "llama-3.3-70b-versatile", "name": "Llama 3.3 70B",  "ctx": 128_000},
@@ -97,12 +95,10 @@ def call_with_fallback(
 
     for model in models:
         mid = model["id"]
-
         if not is_available(mid):
             wait = model_cooldown[mid] - time.time()
             tried.append(f"{model['name']} — cooling down ({format_wait(wait)} left)")
             continue
-
         try:
             resp = client.chat.completions.create(
                 model=mid,
@@ -114,19 +110,15 @@ def call_with_fallback(
             text = resp.choices[0].message.content.strip()
             print(f"[model] ✓ {mid}")
             return text, mid
-
         except RateLimitError as e:
             wait = parse_retry_after(e)
             mark_rate_limited(mid, wait)
             tried.append(f"{model['name']} — rate limited (retry in {format_wait(wait)})")
             continue
-
         except APIStatusError as e:
             mark_rate_limited(mid, 15)
             tried.append(f"{model['name']} — API error {e.status_code}")
-            print(f"[api-error] {mid} status={e.status_code}")
             continue
-
         except Exception as e:
             tried.append(f"{model['name']} — {type(e).__name__}")
             print(f"[error] {mid} → {e}")
@@ -137,194 +129,312 @@ def call_with_fallback(
 
 
 # ─────────────────────────────────────────────────────────────────────
-#  WEB SEARCH  (requests only — 3-layer fallback for reliability)
+#  WEB SEARCH  —  4 independent sources, all using `requests` only
+#
+#  Source 1: CoinGecko API        → crypto prices (dedicated, reliable)
+#  Source 2: DuckDuckGo HTML      → general web search (PRIMARY for all queries)
+#  Source 3: Wikipedia REST       → encyclopaedic / factual
+#  Source 4: wttr.in JSON         → weather queries
+#
+#  The function tries ALL applicable sources and merges results.
+#  It never silently fails — if results exist, they're returned.
 # ─────────────────────────────────────────────────────────────────────
-SEARCH_HEADERS = {
-    "User-Agent": "Mozilla/5.0 (Windows NT 10.0; Win64; x64) "
-                  "AppleWebKit/537.36 (KHTML, like Gecko) "
-                  "Chrome/120.0.0.0 Safari/537.36",
-    "Accept": "application/json, text/html, */*",
+
+HEADERS = {
+    "User-Agent": (
+        "Mozilla/5.0 (Windows NT 10.0; Win64; x64) "
+        "AppleWebKit/537.36 (KHTML, like Gecko) "
+        "Chrome/124.0.0.0 Safari/537.36"
+    ),
     "Accept-Language": "en-US,en;q=0.9",
+    "Accept": "text/html,application/xhtml+xml,application/xml;q=0.9,*/*;q=0.8",
 }
 
-def _ddg_json(query: str, max_results: int) -> list[dict]:
-    """DuckDuckGo Instant Answer JSON API — best for facts & definitions."""
-    r = requests.get(
-        "https://api.duckduckgo.com/",
-        params={"q": query, "format": "json", "no_html": "1",
-                "no_redirect": "1", "skip_disambig": "1"},
-        headers=SEARCH_HEADERS,
-        timeout=8,
-    )
-    r.raise_for_status()
-    data = r.json()
-    results = []
+# ── Crypto detection ──────────────────────────────────────────────────
+CRYPTO_MAP = {
+    "bitcoin": "bitcoin",  "btc": "bitcoin",
+    "ethereum": "ethereum", "eth": "ethereum",
+    "dogecoin": "dogecoin", "doge": "dogecoin",
+    "solana": "solana",     "sol": "solana",
+    "bnb": "binancecoin",   "binance coin": "binancecoin",
+    "xrp": "ripple",        "ripple": "ripple",
+    "cardano": "cardano",   "ada": "cardano",
+    "litecoin": "litecoin", "ltc": "litecoin",
+    "polkadot": "polkadot", "dot": "polkadot",
+    "shiba inu": "shiba-inu", "shib": "shiba-inu",
+}
 
-    if data.get("Answer"):
-        results.append({
-            "title":   "Direct Answer",
-            "url":     data.get("AbstractURL", ""),
-            "snippet": str(data["Answer"])[:500],
-        })
-    if data.get("AbstractText"):
-        results.append({
-            "title":   data.get("Heading") or "Summary",
-            "url":     data.get("AbstractURL", ""),
-            "snippet": data["AbstractText"][:500],
-        })
-    for topic in data.get("RelatedTopics", []):
-        if len(results) >= max_results:
-            break
-        if isinstance(topic, dict) and topic.get("Text"):
-            results.append({
-                "title":   topic["Text"][:80],
-                "url":     topic.get("FirstURL", ""),
-                "snippet": topic["Text"][:300],
-            })
-    return results[:max_results]
+def _detect_crypto(query: str) -> list[str]:
+    q = query.lower()
+    return list({cg_id for keyword, cg_id in CRYPTO_MAP.items() if keyword in q})
 
-
-def _wikipedia(query: str) -> list[dict]:
-    """Wikipedia REST summary — excellent for factual/encyclopaedic queries."""
-    # Strip question words for cleaner lookup
-    clean = re.sub(
-        r'\b(what is|who is|what are|tell me about|explain|define|'
-        r'latest|current|today|news|right now|recently|about)\b',
-        '', query, flags=re.IGNORECASE
-    ).strip()
-    clean = ' '.join(clean.split()[:6])
-    if not clean:
-        clean = query
-
-    r = requests.get(
-        f"https://en.wikipedia.org/api/rest_v1/page/summary/{requests.utils.quote(clean)}",
-        headers=SEARCH_HEADERS,
-        timeout=7,
-    )
-    r.raise_for_status()
-    data = r.json()
-    if data.get("extract") and len(data["extract"]) > 60:
-        return [{
-            "title":   data.get("title", "Wikipedia"),
-            "url":     data.get("content_urls", {}).get("desktop", {}).get("page", ""),
-            "snippet": data["extract"][:600],
-        }]
-    return []
-
-
-def _ddg_html_fallback(query: str, max_results: int) -> list[dict]:
-    """
-    Scrape DuckDuckGo HTML search page as a last-resort fallback.
-    Extracts result snippets using a simple regex — no HTML parser needed.
-    """
-    r = requests.get(
-        "https://html.duckduckgo.com/html/",
-        params={"q": query},
-        headers=SEARCH_HEADERS,
-        timeout=10,
-    )
-    r.raise_for_status()
-    html = r.text
-
-    # Extract result snippets between <a class="result__snippet"> tags
-    snippets = re.findall(
-        r'class="result__a"[^>]*href="([^"]+)"[^>]*>([^<]+)</a>.*?'
-        r'class="result__snippet"[^>]*>(.*?)</(?:a|span)>',
-        html, re.DOTALL
-    )
-    results = []
-    for url, title, snippet in snippets[:max_results]:
-        clean_snippet = re.sub(r'<[^>]+>', '', snippet).strip()
-        clean_title   = re.sub(r'<[^>]+>', '', title).strip()
-        if clean_snippet:
-            results.append({
-                "title":   clean_title[:100],
-                "url":     url,
-                "snippet": clean_snippet[:300],
-            })
-    return results
-
-
-def web_search(query: str, max_results: int = 4) -> list[dict]:
-    """
-    3-layer search — tries each source in order, merges best results.
-    Uses only `requests`. Returns [] only if all three layers fail.
-    """
-    results: list[dict] = []
-
-    # Layer 1: DDG Instant Answer API
+def _search_crypto(coin_ids: list[str]) -> list[dict]:
+    """CoinGecko free API — no key needed, very reliable."""
     try:
-        results += _ddg_json(query, max_results)
-        print(f"[search] DDG JSON → {len(results)} results")
+        ids_str = ",".join(coin_ids)
+        r = requests.get(
+            "https://api.coingecko.com/api/v3/simple/price",
+            params={
+                "ids": ids_str,
+                "vs_currencies": "usd",
+                "include_24hr_change": "true",
+                "include_market_cap": "true",
+            },
+            timeout=8,
+        )
+        r.raise_for_status()
+        data = r.json()
+        results = []
+        for coin_id, info in data.items():
+            price     = info.get("usd", "N/A")
+            change    = info.get("usd_24h_change", None)
+            mktcap    = info.get("usd_market_cap", None)
+            change_str = f", 24h change: {change:.2f}%" if change is not None else ""
+            cap_str    = f", market cap: ${mktcap:,.0f}" if mktcap else ""
+            results.append({
+                "title":   f"{coin_id.capitalize()} Price (Live)",
+                "url":     f"https://www.coingecko.com/en/coins/{coin_id}",
+                "snippet": f"Current {coin_id} price: ${price:,.2f} USD{change_str}{cap_str}.",
+            })
+        print(f"[search] CoinGecko → {len(results)} results")
+        return results
     except Exception as e:
-        print(f"[search] DDG JSON failed: {e}")
+        print(f"[search] CoinGecko failed: {e}")
+        return []
 
-    # Layer 2: Wikipedia (always try — different source, often great)
+# ── Weather detection ─────────────────────────────────────────────────
+WEATHER_WORDS = {"weather", "temperature", "forecast", "humidity", "rain", "sunny", "hot", "cold", "climate today"}
+
+def _detect_weather_city(query: str) -> str | None:
+    q = query.lower()
+    if not any(w in q for w in WEATHER_WORDS):
+        return None
+    # Extract city: "weather in Chennai" → "Chennai"
+    m = re.search(r'weather\s+(?:in|at|for|of)?\s+([A-Za-z\s]{2,30})', query, re.IGNORECASE)
+    if m:
+        return m.group(1).strip()
+    # "Chennai weather" → "Chennai"
+    m = re.search(r'([A-Za-z\s]{2,20})\s+weather', query, re.IGNORECASE)
+    if m:
+        return m.group(1).strip()
+    return None
+
+def _search_weather(city: str) -> list[dict]:
+    """wttr.in free weather API — no key needed."""
     try:
-        wiki = _wikipedia(query)
-        # Only add if not duplicate
-        existing_urls = {r["url"] for r in results}
-        for w in wiki:
-            if w["url"] not in existing_urls:
-                results.append(w)
-        print(f"[search] Wikipedia → {len(wiki)} results")
+        r = requests.get(
+            f"https://wttr.in/{requests.utils.quote(city)}",
+            params={"format": "j1"},
+            headers={"User-Agent": "ZippyAI/1.0"},
+            timeout=7,
+        )
+        r.raise_for_status()
+        data = r.json()
+        cur = data["current_condition"][0]
+        desc     = cur.get("weatherDesc", [{}])[0].get("value", "N/A")
+        temp_c   = cur.get("temp_C", "N/A")
+        temp_f   = cur.get("temp_F", "N/A")
+        feels_c  = cur.get("FeelsLikeC", "N/A")
+        humidity = cur.get("humidity", "N/A")
+        wind     = cur.get("windspeedKmph", "N/A")
+        snippet  = (
+            f"Current weather in {city}: {desc}. "
+            f"Temperature: {temp_c}°C ({temp_f}°F), feels like {feels_c}°C. "
+            f"Humidity: {humidity}%, Wind: {wind} km/h."
+        )
+        print(f"[search] wttr.in → weather for {city}")
+        return [{"title": f"Weather in {city}", "url": f"https://wttr.in/{city}", "snippet": snippet}]
+    except Exception as e:
+        print(f"[search] wttr.in failed: {e}")
+        return []
+
+# ── DuckDuckGo HTML search (PRIMARY general search) ───────────────────
+def _search_ddg_html(query: str, max_results: int = 5) -> list[dict]:
+    """
+    Scrapes DuckDuckGo's HTML results page.
+    This is the most reliable general-purpose free search — real web results.
+    """
+    try:
+        r = requests.post(
+            "https://html.duckduckgo.com/html/",
+            data={"q": query, "b": "", "kl": "us-en"},
+            headers=HEADERS,
+            timeout=10,
+        )
+        r.raise_for_status()
+        html = r.text
+
+        results = []
+
+        # DDG HTML structure:
+        # <h2 class="result__title"><a class="result__a" href="...">TITLE</a></h2>
+        # <a class="result__snippet" ...>SNIPPET</a>
+
+        # Split into individual result blocks
+        blocks = re.split(r'<div class="result results_links', html)
+
+        for block in blocks[1:]:  # skip first (header)
+            if len(results) >= max_results:
+                break
+
+            # Extract title
+            title_m = re.search(
+                r'class="result__a"[^>]*>(.*?)</a>', block, re.DOTALL
+            )
+            # Extract URL from the uddg redirect param
+            url_m = re.search(
+                r'href="//duckduckgo\.com/l/\?uddg=([^"&]+)', block
+            )
+            if not url_m:
+                url_m = re.search(r'class="result__a"\s+href="([^"]+)"', block)
+
+            # Extract snippet
+            snip_m = re.search(
+                r'class="result__snippet"[^>]*>(.*?)</a>', block, re.DOTALL
+            )
+
+            if title_m and snip_m:
+                title   = re.sub(r'<[^>]+>', '', title_m.group(1)).strip()
+                snippet = re.sub(r'<[^>]+>', '', snip_m.group(1)).strip()
+                snippet = re.sub(r'\s+', ' ', snippet)
+
+                url = ""
+                if url_m:
+                    raw_url = url_m.group(1)
+                    try:
+                        from urllib.parse import unquote
+                        url = unquote(raw_url)
+                    except Exception:
+                        url = raw_url
+
+                if title and snippet and len(snippet) > 20:
+                    results.append({
+                        "title":   title[:120],
+                        "url":     url,
+                        "snippet": snippet[:400],
+                    })
+
+        print(f"[search] DDG HTML → {len(results)} results")
+        return results
+
+    except Exception as e:
+        print(f"[search] DDG HTML failed: {e}")
+        return []
+
+# ── Wikipedia ─────────────────────────────────────────────────────────
+def _search_wikipedia(query: str) -> list[dict]:
+    try:
+        clean = re.sub(
+            r'\b(what is|who is|what are|tell me|explain|define|'
+            r'latest|current|today|price|news|right now|recently|about|the)\b',
+            '', query, flags=re.IGNORECASE
+        ).strip()
+        clean = ' '.join(clean.split()[:6])
+        if not clean or len(clean) < 3:
+            return []
+
+        r = requests.get(
+            f"https://en.wikipedia.org/api/rest_v1/page/summary/{requests.utils.quote(clean)}",
+            headers={"User-Agent": "ZippyAI/1.0"},
+            timeout=6,
+        )
+        r.raise_for_status()
+        data = r.json()
+        if data.get("extract") and len(data["extract"]) > 80:
+            return [{
+                "title":   data.get("title", "Wikipedia"),
+                "url":     data.get("content_urls", {}).get("desktop", {}).get("page", ""),
+                "snippet": data["extract"][:600],
+            }]
+        return []
     except Exception as e:
         print(f"[search] Wikipedia failed: {e}")
+        return []
 
-    # Layer 3: DDG HTML scrape — only if still empty
-    if not results:
-        try:
-            results += _ddg_html_fallback(query, max_results)
-            print(f"[search] DDG HTML fallback → {len(results)} results")
-        except Exception as e:
-            print(f"[search] DDG HTML fallback failed: {e}")
 
+# ── Master search function ─────────────────────────────────────────────
+def web_search(query: str, max_results: int = 5) -> list[dict]:
+    """
+    Runs ALL applicable search sources simultaneously (by query type),
+    merges results, deduplicates by URL.
+    Always returns whatever data was found — never fails silently.
+    """
+    results: list[dict] = []
+    seen_urls: set[str] = set()
+
+    def add(items: list[dict]):
+        for item in items:
+            url = item.get("url", "")
+            key = url or item.get("title", "")
+            if key and key not in seen_urls:
+                seen_urls.add(key)
+                results.append(item)
+
+    # 1. Crypto prices — dedicated API, very accurate
+    coins = _detect_crypto(query)
+    if coins:
+        add(_search_crypto(coins))
+
+    # 2. Weather — dedicated API
+    city = _detect_weather_city(query)
+    if city:
+        add(_search_weather(city))
+
+    # 3. DuckDuckGo HTML — real web search, best for current events/news
+    add(_search_ddg_html(query, max_results))
+
+    # 4. Wikipedia — good complement for factual context
+    add(_search_wikipedia(query))
+
+    print(f"[search] total merged results: {len(results)}")
     return results[:max_results]
 
 
-def format_search_context(results: list[dict]) -> str:
+def format_search_context(query: str, results: list[dict]) -> str:
+    """Format search results clearly so the AI can use them accurately."""
     if not results:
-        return ""
-    lines = ["[Web Search Results — use these to answer the question accurately]"]
-    for i, r in enumerate(results, 1):
-        lines.append(
-            f"{i}. {r.get('title', '')}\n"
-            f"   {r.get('snippet', '')[:350]}\n"
-            f"   Source: {r.get('url', '')}"
+        return (
+            f"[SEARCH ATTEMPTED for: '{query}' — no results returned. "
+            f"Be honest that you don't have current data.]"
         )
-    return "\n\n".join(lines)
+
+    lines = [
+        f"[LIVE WEB SEARCH RESULTS for: '{query}']",
+        f"[Retrieved: {time.strftime('%Y-%m-%d %H:%M UTC', time.gmtime())}]",
+        "",
+    ]
+    for i, r in enumerate(results, 1):
+        lines.append(f"Result {i}: {r.get('title', 'No title')}")
+        lines.append(f"  Info: {r.get('snippet', '').strip()}")
+        if r.get("url"):
+            lines.append(f"  URL: {r['url']}")
+        lines.append("")
+
+    lines.append("[END OF SEARCH RESULTS]")
+    return "\n".join(lines)
 
 
 # ─────────────────────────────────────────────────────────────────────
-#  IMAGE GENERATION DETECTION
-#  Catch these requests early and return a clear "I can't do that" reply
+#  IMAGE DETECTION + DECLINE
 # ─────────────────────────────────────────────────────────────────────
-IMAGE_GEN_PATTERNS = [
-    r'\bgenerate\s+(?:an?\s+)?image\b',
-    r'\bcreate\s+(?:an?\s+)?image\b',
-    r'\bmake\s+(?:an?\s+)?image\b',
-    r'\bdraw\s+(?:me\s+)?(?:an?\s+)?\b',
-    r'\bpaint\s+(?:me\s+)?\b',
-    r'\bdesign\s+(?:an?\s+)?image\b',
-    r'\bgenerate\s+(?:a\s+)?(?:picture|photo|illustration|artwork|graphic|wallpaper|logo)\b',
-    r'\bcreate\s+(?:a\s+)?(?:picture|photo|illustration|artwork|graphic|wallpaper|logo)\b',
-    r'\bshow\s+me\s+(?:a\s+)?(?:picture|photo|image)\b',
-    r'^/imagine\b',
-    r'\bimagine\s+(?:a\s+)?(?:picture|photo|image|scene)\b',
-]
-IMAGE_GEN_RE = re.compile('|'.join(IMAGE_GEN_PATTERNS), re.IGNORECASE)
+IMAGE_GEN_RE = re.compile(
+    r'\b(generate|create|make|draw|paint|design|produce|render)\b.{0,20}'
+    r'\b(image|picture|photo|illustration|artwork|graphic|wallpaper|logo|poster|banner|sketch|portrait)\b'
+    r'|^/imagine\b',
+    re.IGNORECASE
+)
 
 def is_image_request(text: str) -> bool:
     return bool(IMAGE_GEN_RE.search(text))
 
 IMAGE_DECLINE = (
-    "I can't generate or create images — I'm a text-only AI. 🙅\n\n"
-    "For image generation, try one of these free tools:\n"
-    "• **[Adobe Firefly](https://firefly.adobe.com)** — free, high quality\n"
+    "I'm a text-only AI — I can't generate or create images. 🙅\n\n"
+    "Try these free image generators instead:\n"
+    "• **[Adobe Firefly](https://firefly.adobe.com)** — high quality, free\n"
     "• **[Microsoft Designer](https://designer.microsoft.com)** — free with Microsoft account\n"
-    "• **[Ideogram](https://ideogram.ai)** — free tier available\n"
-    "• **[Craiyon](https://www.craiyon.com)** — completely free\n\n"
-    "I'm great at writing prompts for those tools though — want me to write a detailed prompt for your idea? ✍️"
+    "• **[Ideogram](https://ideogram.ai)** — great for text in images\n"
+    "• **[Craiyon](https://www.craiyon.com)** — completely free, no account needed\n\n"
+    "Want me to write a detailed prompt for any of those tools? ✍️"
 )
 
 
@@ -333,99 +443,117 @@ IMAGE_DECLINE = (
 # ─────────────────────────────────────────────────────────────────────
 SYSTEM = """You are Zippy, a smart AI assistant made by Arul Vethathiri.
 
-## Core identity
-- You are a text-only AI. You CANNOT generate, create, or display images. Ever.
-- You CAN search the web for current information when needed.
-- You were created by Arul Vethathiri, a Class 11 student (2026).
+## WHO YOU ARE
+- Text-only AI. You CANNOT generate images. Period.
+- You CAN search the web — live search results will be injected into your context when needed.
+- Made by Arul Vethathiri, Class 11 student (2026).
 
-## Tone
-- Smart, calm, helpful. Like a knowledgeable friend, not a corporate bot.
-- Natural and conversational — not stiff, not over-excited.
-- Greetings: short and casual. "Hey!" or "Hi, what's up?" — not a paragraph.
+## HOW TO USE SEARCH RESULTS
+When you see [LIVE WEB SEARCH RESULTS] in the context:
+- USE THAT DATA. It is real, current, and accurate.
+- State the information directly. Do NOT say "I don't have real-time access."
+- Quote numbers/prices exactly as given in the results.
+- Mention where the data came from (e.g. "According to CoinGecko..." or "Based on current data...").
+- If the search returned no results, say honestly: "I searched but couldn't find current data on this."
 
-## Response rules
-1. ALWAYS answer what the user actually asked. Stay on topic.
-2. If a question has a specific answer, give that answer first — don't pad around it.
-3. Simple factual questions → 1-2 sentences maximum.
-4. Explanations → short bullet points, no long preamble.
-5. Code questions → give the code directly with a brief comment if needed.
-6. Math → step by step but brief. Show working.
-7. Creative writing → complete the full piece without preamble.
-8. If web search results are provided, use them. Cite the source naturally in your reply.
-9. If asked about something you don't know and no search results are provided, say so honestly.
-10. NEVER say: Certainly!, Great question!, Of course!, Absolutely!, As an AI, I'd be happy to.
-11. NEVER repeat the question back to the user.
-12. NEVER go off-topic or add unsolicited advice.
-13. Always end with exactly 1 relevant emoji.
+## TONE
+- Smart, calm, friendly — like a knowledgeable friend.
+- Casual but accurate. Not corporate, not over-excited.
+- Short greetings. One sentence max.
 
-## What you cannot do (be honest about these)
-- Generate, draw, or create images of any kind
-- Access the internet in real-time yourself (search results are injected by the system)
-- Remember previous conversations (each chat is fresh)
-- Execute code or run programs"""
+## RESPONSE RULES
+1. Answer EXACTLY what was asked. Stay on topic. Nothing extra.
+2. Factual/numeric answers → lead with the number/fact immediately.
+3. Simple questions → 1-3 sentences max.
+4. Explanations → brief bullet points, no long intro.
+5. Code → give the code directly, minimal comments.
+6. Math → show steps, keep it brief.
+7. Creative tasks → complete the full piece, no preamble.
+8. NEVER say: "I don't have real-time access", "My training data", "As an AI",
+   "Certainly!", "Great question!", "Of course!", "I'd be happy to".
+9. NEVER repeat the question.
+10. NEVER pad answers or add unsolicited advice.
+11. End every response with exactly 1 relevant emoji.
 
-THINK_PROMPT = """You are the reasoning engine for Zippy AI.
+## WHAT YOU CANNOT DO (say this clearly if asked)
+- Generate, draw, or produce images
+- Remember previous sessions
+- Run/execute code"""
 
-Given a user message, decide if a web search is needed.
-Output ONLY raw JSON — no markdown, no backticks, no explanation outside the JSON.
+# The thinking prompt is strict and rule-based — less room for the model to hallucinate
+THINK_PROMPT = """You decide if a user question needs a live web search.
 
-JSON keys:
-- "needs_search": boolean
-- "search_query": string (empty string if needs_search is false)
-- "reasoning": string (one sentence)
+Output ONLY a JSON object. No markdown. No extra text. Just JSON.
 
-Search IS needed when the question requires:
-  current events, breaking news, live prices, stock prices, sports scores,
-  weather, "latest" or "recent" news, "today", "this week", "right now",
-  new product releases, who currently holds a position/title,
-  anything that changes over time and the answer from 2023 might be wrong.
+Rules:
+- needs_search = true  → question requires data that changes over time
+- needs_search = false → question can be answered from general knowledge alone
 
-Search is NOT needed for:
-  coding help, algorithms, math, science concepts, history (pre-2023),
-  grammar, language, creative writing, general advice, definitions,
-  how-to guides, programming concepts, explanations of technology,
-  opinions, greetings, identity questions, jokes, poems.
+ALWAYS search for:
+- Any price (crypto, stock, gold, currency, commodity)
+- Any score, result, or standing (sports, elections, awards)
+- Any "latest", "recent", "current", "today", "now", "this week", "2024", "2025" question
+- Weather or temperature for a location
+- Who currently holds a job/title/position
+- New product releases or announcements
+- Any news event that could have changed since 2023
 
-Examples:
-User: "what is the current price of bitcoin"
-{"needs_search": true, "search_query": "bitcoin price today", "reasoning": "Bitcoin price changes by the second."}
+NEVER search for:
+- How to code something (algorithms, syntax, concepts)
+- Math problems
+- Science concepts (physics, chemistry, biology theory)
+- History before 2023
+- Grammar, language, translation
+- Definitions of stable concepts
+- Creative writing, poems, stories
+- Opinions or advice
+- Greetings or small talk
 
-User: "write a python function to reverse a string"
-{"needs_search": false, "search_query": "", "reasoning": "This is a coding question answerable from training data."}
+JSON format:
+{
+  "needs_search": true or false,
+  "search_query": "optimized search query string or empty string",
+  "reasoning": "one sentence"
+}
 
-User: "who won the IPL 2025"
-{"needs_search": true, "search_query": "IPL 2025 winner", "reasoning": "Recent sports result not in training data."}
+Good search queries: short, specific, optimised for search engines.
+Example: user asks "what is bitcoin price" → search_query: "bitcoin price USD today"
+Example: user asks "who won IPL 2025" → search_query: "IPL 2025 winner"
+Example: user asks "weather in Chennai" → search_query: "Chennai weather today"
 
-User: "explain recursion"
-{"needs_search": false, "search_query": "", "reasoning": "Timeless programming concept."}
-
-Output only raw JSON."""
+Output only the JSON object."""
 
 
 # ─────────────────────────────────────────────────────────────────────
 #  STATIC REPLIES
 # ─────────────────────────────────────────────────────────────────────
 IDENTITY = {
-    "who are you":       "I'm Zippy, a text-based AI assistant made by Arul Vethathiri! 🤖",
-    "what are you":      "I'm Zippy, a text-only AI made by Arul Vethathiri. 🤖",
-    "who made you":      "I was made by Arul Vethathiri, a Class 11 student. 👨‍💻",
+    "who are you":       "I'm Zippy, a text-based AI made by Arul Vethathiri! 🤖",
+    "what are you":      "I'm Zippy — a text-only AI assistant made by Arul Vethathiri. 🤖",
+    "who made you":      "Arul Vethathiri, a Class 11 student. 👨‍💻",
     "who created you":   "I was created by Arul Vethathiri. 👨‍💻",
-    "who built you":     "I was built by Arul Vethathiri. 👨‍💻",
-    "what is your name": "My name is Zippy! 😊",
-    "what can you do":   "I can answer questions, help with code, explain concepts, do math, write text, and search the web for current info. I can't generate images though. 💬",
-    "are you an ai":     "Yes! I'm Zippy, a text-only AI made by Arul Vethathiri. 🤖",
-    "are you human":     "Nope! I'm Zippy — an AI, but a pretty good one at conversation. 😄",
+    "who built you":     "Built by Arul Vethathiri. 👨‍💻",
+    "what is your name": "I'm Zippy! 😊",
+    "what can you do":   (
+        "I can answer questions, help with code, explain concepts, do math, "
+        "write anything, and search the web for live data like prices and news. "
+        "I can't generate images though. 💬"
+    ),
+    "are you an ai":     "Yes — Zippy AI, made by Arul Vethathiri. 🤖",
+    "are you human":     "Nope, I'm Zippy — an AI. But a pretty good one! 😄",
 }
 
 SOCIAL = {
     "thanks":     "You're welcome! 😊",
     "thank you":  "Happy to help! 🌟",
-    "bye":        "Goodbye! Take care! 👋",
-    "goodbye":    "See you later! 👋",
-    "good night": "Good night! Sleep well! 🌙",
-    "hello":      "Hey! What can I help you with? 👋",
+    "bye":        "Goodbye! 👋",
+    "goodbye":    "See you! 👋",
+    "good night": "Good night! 🌙",
+    "hello":      "Hey! What do you need? 👋",
     "hi":         "Hi! What's up? 😊",
-    "hey":        "Hey! What do you need? 👋",
+    "hey":        "Hey! 👋",
+    "ok":         "Sure, let me know if you need anything. 👍",
+    "okay":       "Sure, let me know if you need anything. 👍",
 }
 
 
@@ -433,6 +561,7 @@ SOCIAL = {
 #  THINKING STEP
 # ─────────────────────────────────────────────────────────────────────
 def run_thinking(user_input: str) -> dict:
+    """Use a small model to decide search strategy. Very low temperature = consistent JSON."""
     messages = [
         {"role": "system", "content": THINK_PROMPT},
         {"role": "user",   "content": user_input},
@@ -440,19 +569,54 @@ def run_thinking(user_input: str) -> dict:
     try:
         raw, _ = call_with_fallback(
             messages, THINK_MODELS,
-            max_tokens=150, temperature=0.1, top_p=0.9,
+            max_tokens=120, temperature=0.05, top_p=0.9,
         )
+        # Strip any markdown fences the model might add
         raw = re.sub(r"```(?:json)?|```", "", raw).strip()
-        # Sometimes the model wraps with extra text before/after — extract JSON object
-        json_match = re.search(r'\{.*\}', raw, re.DOTALL)
-        if json_match:
-            raw = json_match.group(0)
-        return json.loads(raw)
+        # Extract first JSON object found (in case model adds commentary)
+        m = re.search(r'\{[^{}]+\}', raw, re.DOTALL)
+        if m:
+            raw = m.group(0)
+        result = json.loads(raw)
+        # Validate expected keys exist
+        if "needs_search" not in result:
+            raise ValueError("Missing needs_search key")
+        return result
     except RuntimeError:
         return {"needs_search": False, "search_query": "", "reasoning": "Thinking skipped (quota)."}
     except Exception as e:
-        print(f"[thinking] parse error: {e} | raw was: {raw if 'raw' in dir() else 'N/A'}")
-        return {"needs_search": False, "search_query": "", "reasoning": "Thinking skipped (parse error)."}
+        print(f"[thinking] failed: {e}")
+        # Fallback: use keyword-based decision
+        return _keyword_search_decision(user_input)
+
+
+# Keyword-based fallback if the thinking model fails
+SEARCH_KEYWORDS = [
+    "price", "cost", "worth", "value", "rate", "exchange",
+    "bitcoin", "crypto", "stock", "share", "market",
+    "weather", "temperature", "forecast",
+    "score", "result", "winner", "won", "beat",
+    "latest", "recent", "current", "today", "now", "live",
+    "this week", "this month", "2024", "2025", "2026",
+    "news", "update", "announce", "release", "launch",
+    "who is", "who's the current", "who won",
+    "ipl", "cricket", "football", "nba", "nfl", "match",
+]
+
+def _keyword_search_decision(user_input: str) -> dict:
+    lower = user_input.lower()
+    for kw in SEARCH_KEYWORDS:
+        if kw in lower:
+            return {
+                "needs_search": True,
+                "search_query": user_input,
+                "reasoning": f"Keyword '{kw}' detected — search needed.",
+            }
+    return {
+        "needs_search": False,
+        "search_query": "",
+        "reasoning": "No time-sensitive keywords detected.",
+    }
 
 
 # ─────────────────────────────────────────────────────────────────────
@@ -469,19 +633,19 @@ class ChatRequest(BaseModel):
 @app.get("/")
 def root():
     now = time.time()
-    model_status = {}
+    status = {}
     for m in CHAT_MODELS:
         cd = model_cooldown.get(m["id"], 0)
-        model_status[m["name"]] = (
+        status[m["name"]] = (
             "available" if cd <= now
-            else f"cooling down — {format_wait(cd - now)} left"
+            else f"cooling — {format_wait(cd - now)} left"
         )
-    return {"status": "Zippy backend is running!", "models": model_status}
+    return {"status": "Zippy backend is running!", "models": status}
 
 
 @app.post("/chat")
 def chat(req: ChatRequest):
-    # 1. Clean filler sounds at start of message
+    # 1. Strip filler sounds
     user_input = re.sub(
         r'^(mm+|um+|uh+|hmm+|hm+|err+|ah+|oh+)\s+',
         '', req.message, flags=re.IGNORECASE
@@ -493,17 +657,17 @@ def chat(req: ChatRequest):
 
     text_lower = user_input.lower().strip()
 
-    # 2. Image generation — catch and decline immediately, no model call needed
+    # 2. Image generation → decline immediately
     if is_image_request(user_input):
         return {
             "reply":      IMAGE_DECLINE,
-            "thinking":   "User asked for image generation — Zippy is text-only, declined with alternatives.",
+            "thinking":   "Image generation request detected — Zippy is text-only.",
             "searched":   False,
             "sources":    [],
             "model_used": "static",
         }
 
-    # 3. Static identity / social replies
+    # 3. Static replies
     if text_lower in IDENTITY:
         return {"reply": IDENTITY[text_lower], "thinking": "Identity — hardcoded.",
                 "searched": False, "sources": [], "model_used": "static"}
@@ -511,58 +675,57 @@ def chat(req: ChatRequest):
         return {"reply": SOCIAL[text_lower], "thinking": "Social — hardcoded.",
                 "searched": False, "sources": [], "model_used": "static"}
 
-    # 4. Thinking step — should we search?
+    # 4. Thinking step — decide search strategy
     think        = run_thinking(user_input)
     needs_search = think.get("needs_search", False)
     search_query = think.get("search_query", "").strip()
     reasoning    = think.get("reasoning", "")
 
-    # 5. Web search (3-layer fallback — very reliable)
+    # 5. Web search — runs ALL applicable sources, merges results
     search_context = ""
     searched       = False
     search_sources: list[dict] = []
 
     if needs_search and search_query:
-        print(f"[search] querying: {search_query}")
+        print(f"[search] → '{search_query}'")
         results = web_search(search_query)
+        search_context = format_search_context(search_query, results)
         if results:
-            search_context = format_search_context(results)
             searched = True
-            search_sources = results[:4]
-            print(f"[search] got {len(results)} results")
+            search_sources = results
+            print(f"[search] ✓ {len(results)} results ready for model")
         else:
-            # Search was attempted but returned nothing — tell the model
-            search_context = "[Web search was attempted but returned no results. Answer from your training knowledge and note the limitation.]"
-            print("[search] no results returned")
+            print("[search] ✗ all sources returned empty")
 
-    # 6. Build the final prompt — tightly scoped to what was asked
+    # 6. Build the final messages for the AI
     messages: list[dict] = [{"role": "system", "content": SYSTEM}]
 
-    # Add conversation history (keep last 20 turns)
+    # Add conversation history
     for h in req.history[-20:]:
         if isinstance(h, dict) and h.get("role") and h.get("content"):
-            messages.append({"role": h["role"], "content": str(h["content"])[:1000]})
+            messages.append({
+                "role":    h["role"],
+                "content": str(h["content"])[:1200],
+            })
 
-    # Compose the user message with optional search context
+    # Compose user message — search context injected BEFORE the question
     if search_context:
         final_user = (
             f"{search_context}\n\n"
-            f"---\n"
-            f"Using the search results above, answer this question directly and stay on topic:\n"
+            f"Using ONLY the search results above, answer this question directly "
+            f"and accurately. Do NOT say you lack real-time access:\n\n"
             f"{user_input}"
         )
     else:
-        final_user = (
-            f"Answer this directly and stay on topic:\n{user_input}"
-        )
+        final_user = user_input
 
     messages.append({"role": "user", "content": final_user})
 
-    # 7. Call with full model fallback chain
+    # 7. Call AI with model fallback chain
     try:
         reply, model_used = call_with_fallback(
             messages, CHAT_MODELS,
-            max_tokens=512, temperature=0.7, top_p=0.9,
+            max_tokens=512, temperature=0.65, top_p=0.9,
         )
         return {
             "reply":      reply,
@@ -573,21 +736,20 @@ def chat(req: ChatRequest):
         }
 
     except RuntimeError as exc:
-        parts     = str(exc).split("|", 2)
-        wait_str  = parts[1] if len(parts) == 3 else "a few minutes"
-        tried_raw = parts[2] if len(parts) == 3 else str(exc)
+        parts       = str(exc).split("|", 2)
+        wait_str    = parts[1] if len(parts) == 3 else "a few minutes"
+        tried_raw   = parts[2] if len(parts) == 3 else str(exc)
         tried_lines = "\n".join(f"• {l}" for l in tried_raw.split("||") if l.strip())
 
-        quota_reply = (
-            f"⚠️ **All AI models are rate-limited right now.**\n\n"
-            f"Please wait at least **{wait_str}** and try again.\n\n"
-            f"*Groq free tier: 30 requests/min · 1,000 requests/day per model. "
-            f"All 5 models are temporarily exhausted.*\n\n"
-            f"**Models tried:**\n{tried_lines}"
-        )
         return {
-            "reply":      quota_reply,
-            "thinking":   "All models rate-limited — quota exceeded message returned.",
+            "reply": (
+                f"⚠️ **All AI models are rate-limited right now.**\n\n"
+                f"Please wait at least **{wait_str}** and try again.\n\n"
+                f"*Groq free tier: 30 req/min · 1,000 req/day per model. "
+                f"All 5 models temporarily exhausted.*\n\n"
+                f"**Models tried:**\n{tried_lines}"
+            ),
+            "thinking":   "All models rate-limited.",
             "searched":   False,
             "sources":    [],
             "model_used": "none",
