@@ -9,7 +9,6 @@ import json
 import time
 import math
 import threading
-import xml.etree.ElementTree as ET
 
 app = FastAPI()
 client = Groq(api_key=os.environ["GROQ_API_KEY"])
@@ -48,8 +47,7 @@ def is_available(model_id: str) -> bool:
     return time.time() >= model_cooldown.get(model_id, 0)
 
 def mark_rate_limited(model_id: str, retry_after: float):
-    available_at = time.time() + retry_after
-    model_cooldown[model_id] = available_at
+    model_cooldown[model_id] = time.time() + retry_after
     print(f"[rate-limit] {model_id} blocked {retry_after:.0f}s")
 
 def parse_retry_after(exc: Exception) -> float:
@@ -97,9 +95,8 @@ def call_with_fallback(
                 model=mid, messages=messages,
                 max_tokens=max_tokens, temperature=temperature, top_p=top_p,
             )
-            text = resp.choices[0].message.content.strip()
             print(f"[model] ✓ {mid}")
-            return text, mid
+            return resp.choices[0].message.content.strip(), mid
         except RateLimitError as e:
             wait = parse_retry_after(e)
             mark_rate_limited(mid, wait)
@@ -115,74 +112,61 @@ def call_with_fallback(
 
 
 # ─────────────────────────────────────────────────────────────────────
-#  SEARCH DECISION
+#  SEARCH DECISION  (AI model + keyword rules with OR logic)
 #
-#  TWO systems run independently, result combined with OR logic:
-#
-#  System A — AI model (run_thinking):
-#    The model reads the message and decides. It uses context, nuance,
-#    and understanding. This is the primary decision maker.
-#    Runs in a thread with a 5s timeout to handle cold starts.
-#
-#  System B — Keyword rules (rules_need_search):
-#    Fast pattern matching. Acts as a safety net.
-#    Catches obvious cases if the model times out or says "no" wrongly.
-#
-#  Final decision = model_says_search OR rules_say_search
-#  This means: search if EITHER system thinks it's needed.
-#  Never miss a search because one system failed.
+#  The AI model decides first (runs in a thread with 5s timeout).
+#  Keyword rules run in parallel as a safety net.
+#  Final decision = model_says_yes  OR  rules_say_yes
+#  This guarantees search works even on cold start.
 # ─────────────────────────────────────────────────────────────────────
 
 THINK_PROMPT = """You are the search decision engine for Zippy AI.
 
-A user sent a message. Decide: does answering this need live data from the web?
+Read the user's message and decide if answering it needs live data from the web.
 
-Your default should lean toward YES — it is better to search and find nothing
-than to confidently give the user outdated information.
+Default lean: YES — better to search unnecessarily than give stale data.
 
-ALWAYS output YES (needs_search: true) for:
-- Any price: crypto, stocks, gold, oil, petrol, forex, USD/INR, dollar rate
-- Weather, temperature, humidity, rain, forecast for any place
-- Sports: match scores, results, winners, standings, IPL, cricket, football, NBA, F1
-- News: anything described as "latest", "recent", "breaking", "today", "now", "this week"
-- Elections, political events, government decisions
-- "Who is the current X" — president, PM, CEO, champion, etc.
-- Software/app versions: "latest version of X", "new update"
-- Any question with the year 2024, 2025, or 2026
-- Anything that could have changed in the last year
+Always output YES for:
+- Any price: crypto, stocks, gold, oil, petrol, forex, currency exchange rates
+- Weather / temperature / forecast for any city or region
+- Sports: scores, results, match winners, standings, IPL, cricket, football, NBA
+- News: anything with "latest", "recent", "breaking", "today", "now", "this week"
+- Elections, government decisions, political events
+- "Who is the current X" — any current role, position, or title
+- Software / app versions: "latest version", "new update", "new release"
+- Any question mentioning years 2024, 2025, 2026
+- Anything that could have changed in the past year
 
-Output NO (needs_search: false) ONLY when you are 100% sure the answer is:
-- Timeless: coding syntax, algorithms, math, physics theory, definitions
-- Historical and settled: events before 2023 with no ongoing relevance
-- Creative: writing poems, stories, code, essays
-- Personal advice or opinions
-- Greetings, thanks, casual chat
+Output NO only when 100% sure the answer is timeless:
+- Pure coding syntax or algorithms
+- Math calculations or theory
+- Science concepts (gravity, photosynthesis, etc.)
+- History before 2023
+- Creative writing tasks
+- Definitions of stable concepts
+- Greetings or casual chat
 
-When in doubt → search.
+When in doubt → always search.
 
 Respond with ONLY this JSON (no markdown, no extra text):
 {
   "needs_search": true or false,
-  "search_query": "short optimised search query, or empty string if false",
+  "search_query": "short optimised query for search engine, empty string if false",
   "reasoning": "one sentence"
 }
 
-Good search queries — short and direct:
-- "bitcoin price today"
-- "weather Chennai now"
-- "IPL 2025 winner"
-- "India vs Australia cricket score"
-- "OpenAI latest news"
+Good query examples:
+- "bitcoin price today USD INR"
+- "weather Chennai today"
+- "IPL 2025 final result winner"
+- "latest OpenAI news 2025"
+- "India prime minister 2025"
 
 JSON only:"""
 
 
 def run_thinking(user_input: str, timeout: float = 5.0) -> dict | None:
-    """
-    Ask the AI model to decide if search is needed.
-    Returns the parsed dict if model responds in time, or None if it times out.
-    None means the caller should fall back to rules.
-    """
+    """Ask AI model to decide. Returns None if it times out."""
     result_box: list[dict] = []
 
     def _call():
@@ -190,10 +174,7 @@ def run_thinking(user_input: str, timeout: float = 5.0) -> dict | None:
             raw, used = call_with_fallback(
                 [{"role": "system", "content": THINK_PROMPT},
                  {"role": "user",   "content": user_input}],
-                THINK_MODELS,
-                max_tokens=100,
-                temperature=0.0,
-                top_p=1.0,
+                THINK_MODELS, max_tokens=100, temperature=0.0, top_p=1.0,
             )
             raw = re.sub(r"```(?:json)?|```", "", raw).strip()
             m   = re.search(r'\{.*?\}', raw, re.DOTALL)
@@ -203,7 +184,7 @@ def run_thinking(user_input: str, timeout: float = 5.0) -> dict | None:
                     parsed["_via"] = used
                     result_box.append(parsed)
         except Exception as e:
-            print(f"[thinking] model call failed: {e}")
+            print(f"[thinking] failed: {e}")
 
     t = threading.Thread(target=_call, daemon=True)
     t.start()
@@ -214,34 +195,31 @@ def run_thinking(user_input: str, timeout: float = 5.0) -> dict | None:
         print(f"[thinking] model={r.get('_via')} needs_search={r['needs_search']} "
               f"query='{r.get('search_query','')}' | {r.get('reasoning','')}")
         return r
-
-    print(f"[thinking] model timed out / failed — using rules only")
+    print(f"[thinking] timed out / failed after {timeout}s")
     return None
 
 
-# Keywords that ALWAYS mean we should search (safety net only)
-_RULE_SEARCH = re.compile(
-    r'\b(price|cost|how much|rate|worth|value\s+of'
-    r'|bitcoin|btc|ethereum|eth|crypto|dogecoin|solana|bnb|xrp|cardano'
-    r'|stock|share|nasdaq|sensex|nifty|nse|bse|gold|silver|oil|petrol|diesel|forex'
-    r'|dollar|rupee|usd|inr|eur|gbp'
-    r'|weather|temperature|forecast|humidity|rainfall'
-    r'|score|result|winner|won|champion|standings|leaderboard'
-    r'|ipl|cricket|football|soccer|nba|nfl|f1|formula\s*1|tennis|wimbledon'
-    r'|news|headline|breaking|latest news|today\'?s news'
-    r'|election|vote|government|president|prime minister|minister|parliament'
+# Broad keyword regex — safety net when model times out
+_RULE_RE = re.compile(
+    r'\b(price|cost|how much|rate|worth|exchange rate'
+    r'|bitcoin|btc|ethereum|eth|crypto|dogecoin|doge|solana|sol'
+    r'|bnb|xrp|ripple|cardano|ada|litecoin|ltc|shiba|matic|polygon|avax|tron'
+    r'|stock|share|market cap|nasdaq|sensex|nifty|nse|bse|dow jones'
+    r'|gold|silver|oil|crude|petrol|diesel|fuel'
+    r'|dollar|rupee|euro|pound|usd|inr|eur|gbp|forex|currency'
+    r'|weather|temperature|forecast|humidity|rainfall|rain today|wind speed'
+    r'|score|result|winner|won|champion|final|standings|leaderboard|ranking'
+    r'|ipl|cricket|football|soccer|nba|nfl|f1|formula.?1|tennis|wimbledon|wwe'
+    r'|news|headline|breaking|latest news|today.?s news|current events'
+    r'|election|vote|government|president|prime minister|minister|parliament|cabinet'
     r'|today|right now|currently|at the moment|as of today|this week|this month'
-    r'|2024|2025|2026|latest|recent|live|real.?time|new update|new release'
-    r'|earthquake|flood|cyclone|storm|disaster|accident|attack|war|conflict)\b',
+    r'|2024|2025|2026|latest|recent|live|real.?time|new update|new release|just released'
+    r'|earthquake|flood|cyclone|storm|disaster|accident|war|conflict|attack)\b',
     re.IGNORECASE,
 )
 
 def rules_need_search(user_input: str) -> tuple[bool, str]:
-    """
-    Keyword-based search detection. Safety net only.
-    Returns (should_search, query_string).
-    """
-    if _RULE_SEARCH.search(user_input):
+    if _RULE_RE.search(user_input):
         q = user_input.strip().rstrip("?.!").strip()
         return True, q
     return False, ""
@@ -249,199 +227,266 @@ def rules_need_search(user_input: str) -> tuple[bool, str]:
 
 def decide_search(user_input: str) -> tuple[bool, str, str]:
     """
-    Combined decision using OR logic:
-      search = model_says_yes  OR  rules_say_yes
-
-    Returns (needs_search, search_query, reasoning).
-
-    The AI model is always asked first.
-    Rules are a safety net — they can upgrade a "no" to a "yes"
-    but cannot downgrade a model "yes" to a "no".
+    OR logic: search if model says yes OR rules say yes.
+    Model runs first in a thread. Rules always run regardless.
+    Prefers model's search query (smarter), falls back to rules query.
     """
-    # Run model thinking (may return None if it timed out)
-    model_result = run_thinking(user_input, timeout=5.0)
+    model_result              = run_thinking(user_input, timeout=5.0)
+    model_search              = model_result["needs_search"]  if model_result else False
+    model_query               = (model_result.get("search_query") or "").strip() if model_result else ""
+    model_reason              = model_result.get("reasoning", "") if model_result else ""
 
-    model_search = model_result.get("needs_search", False) if model_result else False
-    model_query  = (model_result.get("search_query") or "").strip() if model_result else ""
-    model_reason = model_result.get("reasoning", "") if model_result else ""
+    rule_search, rule_query   = rules_need_search(user_input)
 
-    rule_search, rule_query = rules_need_search(user_input)
-
-    # OR logic: search if either system says yes
     needs_search = model_search or rule_search
 
-    # Prefer model's query (more intelligent), fall back to rule query, then raw input
     if needs_search:
         search_query = model_query or rule_query or user_input.strip().rstrip("?.!")
-        if model_search and not rule_search:
-            reasoning = model_reason or "Model decided search is needed."
-        elif rule_search and not model_search:
-            reasoning = f"Rules detected search keyword (model said no / timed out). {model_reason}".strip()
-        else:
+        if model_search and rule_search:
             reasoning = model_reason or "Both model and rules agree: search needed."
+        elif model_search:
+            reasoning = model_reason or "Model decided search is needed."
+        else:
+            reasoning = f"Rules detected live-data keyword (model said no/timed out)."
     else:
         search_query = ""
-        reasoning = model_reason or "No live data needed for this question."
+        reasoning    = model_reason or "No live data needed."
 
-    print(f"[decide] model={model_search} rules={rule_search} → search={needs_search} "
-          f"query='{search_query}'")
+    print(f"[decide] model={model_search} rules={rule_search} "
+          f"→ search={needs_search} query='{search_query}'")
     return needs_search, search_query, reasoning
 
 
 # ─────────────────────────────────────────────────────────────────────
 #  SEARCH SOURCES
-#  All free, no API keys, no HTML scraping.
-#  Using stable JSON/XML APIs that work reliably on server IPs.
+#  All free, no API keys required, tested to work on server IPs.
 # ─────────────────────────────────────────────────────────────────────
-BASE_HEADERS = {"User-Agent": "ZippyAI/2.0 (educational project)"}
+BASE_HEADERS = {
+    "User-Agent": "Mozilla/5.0 (compatible; ZippyAI/2.0; +https://github.com/zippy)",
+    "Accept":     "application/json",
+}
 
+# ── 1. REDDIT  (best free news/current events source, always works) ──
+#
+#  Reddit's JSON API requires no key and is never blocked on server IPs.
+#  Each subreddit has a search endpoint that returns real posts with titles
+#  and text content. We search multiple relevant subreddits and merge.
 
-# ── 1. RSS News (BBC + Reuters + Times of India) ──────────────────────
-#  Best source for current events and news. stdlib xml parser — no package.
-
-NEWS_FEEDS = [
-    ("BBC News",        "http://feeds.bbci.co.uk/news/rss.xml"),
-    ("BBC Technology",  "http://feeds.bbci.co.uk/news/technology/rss.xml"),
-    ("BBC Science",     "http://feeds.bbci.co.uk/news/science_and_environment/rss.xml"),
-    ("Reuters",         "https://feeds.reuters.com/reuters/topNews"),
-    ("Times of India",  "https://timesofindia.indiatimes.com/rssfeedstopstories.cms"),
+REDDIT_SUBS = [
+    "worldnews",       # global news
+    "news",            # US/general news
+    "technology",      # tech news
+    "india",           # India-specific news
+    "cricket",         # cricket scores/news
+    "soccer",          # football
+    "nba",             # basketball
+    "stocks",          # stock market
+    "CryptoCurrency",  # crypto news
+    "science",         # science news
 ]
 
-def _fetch_rss(url: str, max_items: int = 8) -> list[dict]:
-    try:
-        r = requests.get(url, headers=BASE_HEADERS, timeout=7)
-        r.raise_for_status()
-        root = ET.fromstring(r.content)
-        items = []
-        for item in root.findall(".//item")[:max_items]:
-            title = item.findtext("title", "").strip()
-            desc  = item.findtext("description", "").strip()
-            link  = item.findtext("link", "").strip()
-            pub   = item.findtext("pubDate", "").strip()
-            # Strip HTML tags from description
-            desc = re.sub(r'<[^>]+>', '', desc).strip()
-            if title and len(title) > 5:
-                items.append({
-                    "title":   title,
-                    "desc":    desc[:300] if desc else "",
-                    "link":    link,
-                    "pubDate": pub,
-                })
-        return items
-    except Exception as e:
-        print(f"[rss] {url} failed: {e}")
-        return []
-
-def _score_relevance(item: dict, keywords: list[str]) -> int:
-    """Simple relevance score: count keyword hits in title + description."""
-    text = (item["title"] + " " + item["desc"]).lower()
-    return sum(1 for kw in keywords if kw.lower() in text)
-
-def search_news(query: str, max_results: int = 4) -> dict | None:
+def search_reddit(query: str, max_results: int = 5) -> dict | None:
     """
-    Search BBC/Reuters/TOI RSS for news matching the query.
-    Returns the top matching articles.
+    Search Reddit across relevant subreddits.
+    Uses Reddit's public JSON API — no key needed, works on all servers.
+    Returns real post titles + selftext content.
     """
-    keywords = [w for w in re.split(r'\W+', query.lower()) if len(w) > 3]
-    if not keywords:
-        keywords = query.lower().split()[:4]
+    keywords = [w.lower() for w in re.split(r'\W+', query) if len(w) > 2]
 
-    all_items: list[dict] = []
+    # Pick the most relevant subreddits for this query
+    q_lower = query.lower()
+    target_subs = []
 
-    # Try each feed, collect articles
-    for feed_name, feed_url in NEWS_FEEDS:
-        items = _fetch_rss(feed_url, max_items=15)
-        for item in items:
-            item["_feed"] = feed_name
-            item["_score"] = _score_relevance(item, keywords)
-        all_items.extend(items)
+    if any(w in q_lower for w in ["cricket", "ipl", "bcci", "test match", "odi", "t20"]):
+        target_subs = ["cricket", "india", "worldnews"]
+    elif any(w in q_lower for w in ["football", "soccer", "premier league", "fifa", "isl"]):
+        target_subs = ["soccer", "football", "worldnews"]
+    elif any(w in q_lower for w in ["nba", "basketball"]):
+        target_subs = ["nba", "sports"]
+    elif any(w in q_lower for w in ["crypto", "bitcoin", "ethereum", "btc", "eth", "coin"]):
+        target_subs = ["CryptoCurrency", "Bitcoin", "stocks"]
+    elif any(w in q_lower for w in ["stock", "share", "market", "sensex", "nifty", "nasdaq"]):
+        target_subs = ["stocks", "investing", "IndiaInvestments"]
+    elif any(w in q_lower for w in ["india", "modi", "delhi", "mumbai", "bollywood"]):
+        target_subs = ["india", "worldnews", "IndiaSpeaks"]
+    elif any(w in q_lower for w in ["tech", "ai", "openai", "google", "apple", "software"]):
+        target_subs = ["technology", "artificial", "worldnews"]
+    else:
+        target_subs = ["worldnews", "news", "technology"]
 
-    if not all_items:
+    all_posts: list[dict] = []
+
+    for sub in target_subs[:3]:   # limit to 3 subs to keep it fast
+        try:
+            url = f"https://www.reddit.com/r/{sub}/search.json"
+            r = requests.get(
+                url,
+                params={"q": query, "sort": "relevance", "t": "month", "limit": 8},
+                headers={**BASE_HEADERS, "User-Agent": "ZippyAI/2.0"},
+                timeout=8,
+            )
+            if r.status_code == 200:
+                data  = r.json()
+                posts = data.get("data", {}).get("children", [])
+                for post in posts:
+                    p = post.get("data", {})
+                    title    = p.get("title", "").strip()
+                    selftext = p.get("selftext", "").strip()
+                    url_post = p.get("url", "")
+                    score    = p.get("score", 0)
+                    created  = p.get("created_utc", 0)
+                    age_days = (time.time() - created) / 86400 if created else 999
+
+                    # Score relevance
+                    text_combined = (title + " " + selftext).lower()
+                    relevance = sum(1 for kw in keywords if kw in text_combined)
+
+                    if title and relevance > 0:
+                        all_posts.append({
+                            "title":     title,
+                            "body":      selftext[:300] if selftext and selftext != "[removed]" else "",
+                            "url":       url_post,
+                            "score":     score,
+                            "relevance": relevance,
+                            "age_days":  age_days,
+                            "sub":       sub,
+                        })
+            print(f"[reddit] r/{sub} → {len(posts) if r.status_code == 200 else 'failed'}")
+        except Exception as e:
+            print(f"[reddit] r/{sub} failed: {e}")
+
+    if not all_posts:
+        # Fallback: just get top posts from r/worldnews
+        try:
+            r = requests.get(
+                "https://www.reddit.com/r/worldnews/hot.json",
+                params={"limit": 8},
+                headers={**BASE_HEADERS, "User-Agent": "ZippyAI/2.0"},
+                timeout=8,
+            )
+            if r.status_code == 200:
+                for post in r.json().get("data", {}).get("children", []):
+                    p = post.get("data", {})
+                    all_posts.append({
+                        "title":     p.get("title", ""),
+                        "body":      "",
+                        "url":       p.get("url", ""),
+                        "score":     p.get("score", 0),
+                        "relevance": 1,
+                        "age_days":  0,
+                        "sub":       "worldnews",
+                    })
+        except Exception as e:
+            print(f"[reddit] fallback failed: {e}")
+
+    if not all_posts:
         return None
 
-    # Sort by relevance, take top results
-    all_items.sort(key=lambda x: x["_score"], reverse=True)
-    top = [i for i in all_items if i["_score"] > 0][:max_results]
-
-    # If no keyword matches, take the top headlines as general news
-    if not top:
-        top = all_items[:max_results]
-
-    if not top:
-        return None
+    # Sort: high relevance first, then recency, then upvotes
+    all_posts.sort(key=lambda x: (-x["relevance"], x["age_days"], -x["score"]))
+    top = all_posts[:max_results]
 
     lines = []
-    for i, item in enumerate(top, 1):
+    for i, p in enumerate(top, 1):
+        body_str = f"\n   {p['body']}" if p["body"] else ""
         lines.append(
-            f"{i}. [{item['_feed']}] {item['title']}\n"
-            f"   {item['desc']}\n"
-            f"   Published: {item.get('pubDate', 'N/A')}\n"
-            f"   Link: {item['link']}"
+            f"{i}. {p['title']}"
+            f"{body_str}\n"
+            f"   Source: reddit.com/r/{p['sub']}  |  Score: {p['score']}\n"
+            f"   Link: {p['url']}"
         )
 
-    print(f"[news] ✓ {len(top)} articles matched from RSS feeds")
+    print(f"[reddit] ✓ returning {len(top)} posts")
     return {
-        "source":  "Live News RSS (BBC/Reuters/TOI)",
-        "title":   f"News results for: {query}",
-        "url":     "https://www.bbc.com/news",
+        "source":  "Reddit (live community posts)",
+        "title":   f"Reddit posts about: {query}",
+        "url":     f"https://www.reddit.com/search/?q={requests.utils.quote(query)}&sort=new",
         "content": "\n\n".join(lines),
     }
 
 
-# ── 2. CoinGecko: live crypto prices ─────────────────────────────────
+# ── 2. CRYPTO PRICES  (CoinGecko primary, CryptoCompare fallback) ─────
+
 CRYPTO_MAP = {
     "bitcoin": "bitcoin",      "btc":  "bitcoin",
     "ethereum": "ethereum",    "eth":  "ethereum",
     "dogecoin": "dogecoin",    "doge": "dogecoin",
     "solana": "solana",        "sol":  "solana",
-    "bnb": "binancecoin",      "binance": "binancecoin",
+    "bnb": "binancecoin",      "binance coin": "binancecoin",
     "xrp": "ripple",           "ripple": "ripple",
     "cardano": "cardano",      "ada":  "cardano",
     "litecoin": "litecoin",    "ltc":  "litecoin",
     "polkadot": "polkadot",    "dot":  "polkadot",
-    "shib": "shiba-inu",       "shiba": "shiba-inu",
+    "shib": "shiba-inu",       "shiba inu": "shiba-inu",
     "tron": "tron",            "trx":  "tron",
     "avax": "avalanche-2",     "avalanche": "avalanche-2",
     "matic": "matic-network",  "polygon": "matic-network",
+    "pepe": "pepe",
 }
 
-def _detect_crypto(q: str) -> list[str]:
-    lower = q.lower()
-    return list({cg_id for kw, cg_id in CRYPTO_MAP.items() if kw in lower})
+# CryptoCompare symbol map (different ID format)
+CRYPTO_CC_MAP = {
+    "bitcoin": "BTC",  "btc":  "BTC",
+    "ethereum": "ETH", "eth":  "ETH",
+    "dogecoin": "DOGE","doge": "DOGE",
+    "solana": "SOL",   "sol":  "SOL",
+    "bnb": "BNB",
+    "xrp": "XRP",      "ripple": "XRP",
+    "cardano": "ADA",  "ada":  "ADA",
+    "litecoin": "LTC", "ltc":  "LTC",
+    "polkadot": "DOT", "dot":  "DOT",
+    "shib": "SHIB",    "shiba": "SHIB",
+    "tron": "TRX",     "trx":  "TRX",
+    "avax": "AVAX",    "avalanche": "AVAX",
+    "matic": "MATIC",  "polygon": "MATIC",
+}
 
-def search_crypto(query: str) -> dict | None:
-    coins = _detect_crypto(query)
-    if not coins:
-        return None
+def _detect_crypto_names(q: str) -> tuple[list[str], list[str]]:
+    """Returns (coingecko_ids, cryptocompare_symbols)."""
+    lower = q.lower()
+    cg_ids  = list({cg_id  for kw, cg_id  in CRYPTO_MAP.items()    if kw in lower})
+    cc_syms = list({sym    for kw, sym     in CRYPTO_CC_MAP.items() if kw in lower})
+    return cg_ids, cc_syms
+
+def _coingecko_prices(coin_ids: list[str]) -> dict | None:
+    """Primary: CoinGecko free API."""
     try:
         r = requests.get(
             "https://api.coingecko.com/api/v3/simple/price",
             params={
-                "ids": ",".join(coins),
-                "vs_currencies": "usd,inr",
+                "ids":                 ",".join(coin_ids),
+                "vs_currencies":       "usd,inr",
                 "include_24hr_change": "true",
                 "include_market_cap":  "true",
                 "include_24hr_vol":    "true",
             },
-            headers=BASE_HEADERS, timeout=8,
+            headers=BASE_HEADERS,
+            timeout=8,
         )
         r.raise_for_status()
         data = r.json()
+        if not data:
+            return None
         lines = []
         for coin_id, info in data.items():
-            usd  = info.get("usd", "N/A")
-            inr  = info.get("inr", "N/A")
+            usd  = info.get("usd",            "N/A")
+            inr  = info.get("inr",            "N/A")
             chg  = info.get("usd_24h_change", None)
             mcap = info.get("usd_market_cap", None)
             vol  = info.get("usd_24h_vol",    None)
+            usd_str  = f"${usd:,.2f}"  if isinstance(usd,  (int, float)) else str(usd)
+            inr_str  = f"₹{inr:,.2f}"  if isinstance(inr,  (int, float)) else str(inr)
+            chg_str  = f"{chg:+.2f}%"  if chg  is not None else "N/A"
+            mcap_str = f"${mcap:,.0f}" if mcap else "N/A"
+            vol_str  = f"${vol:,.0f}"  if vol  else "N/A"
             lines.append(
                 f"{coin_id.capitalize()}:\n"
-                f"  Price:      ${usd:,.2f} USD  /  ₹{inr:,.2f} INR\n"
-                f"  24h Change: {f'{chg:+.2f}%' if chg is not None else 'N/A'}\n"
-                f"  Market Cap: {f'${mcap:,.0f}' if mcap else 'N/A'}\n"
-                f"  24h Volume: {f'${vol:,.0f}'  if vol  else 'N/A'}"
+                f"  Price:      {usd_str} USD  /  {inr_str} INR\n"
+                f"  24h Change: {chg_str}\n"
+                f"  Market Cap: {mcap_str}\n"
+                f"  24h Volume: {vol_str}"
             )
-        print(f"[crypto] ✓ {coins}")
+        print(f"[crypto] CoinGecko ✓ {coin_ids}")
         return {
             "source":  "CoinGecko (live)",
             "title":   "Live Cryptocurrency Prices",
@@ -449,21 +494,89 @@ def search_crypto(query: str) -> dict | None:
             "content": "\n\n".join(lines),
         }
     except Exception as e:
-        print(f"[crypto] failed: {e}")
+        print(f"[crypto] CoinGecko failed: {e}")
         return None
 
+def _cryptocompare_prices(symbols: list[str]) -> dict | None:
+    """Fallback: CryptoCompare — no key needed, very generous free tier."""
+    try:
+        fsyms = ",".join(symbols)
+        r = requests.get(
+            "https://min-api.cryptocompare.com/data/pricemultifull",
+            params={"fsyms": fsyms, "tsyms": "USD,INR"},
+            headers=BASE_HEADERS,
+            timeout=8,
+        )
+        r.raise_for_status()
+        data = r.json().get("RAW", {})
+        if not data:
+            return None
+        lines = []
+        for sym, markets in data.items():
+            usd_data = markets.get("USD", {})
+            inr_data = markets.get("INR", {})
+            price_usd  = usd_data.get("PRICE",          "N/A")
+            price_inr  = inr_data.get("PRICE",          "N/A")
+            chg_pct    = usd_data.get("CHANGEPCT24HOUR","N/A")
+            mcap       = usd_data.get("MKTCAP",         "N/A")
+            vol        = usd_data.get("VOLUME24HOURTO",  "N/A")
+            usd_str    = f"${price_usd:,.2f}"  if isinstance(price_usd, (int,float)) else str(price_usd)
+            inr_str    = f"₹{price_inr:,.2f}"  if isinstance(price_inr, (int,float)) else str(price_inr)
+            chg_str    = f"{chg_pct:+.2f}%"    if isinstance(chg_pct,   (int,float)) else str(chg_pct)
+            mcap_str   = f"${mcap:,.0f}"        if isinstance(mcap,      (int,float)) else str(mcap)
+            vol_str    = f"${vol:,.0f}"          if isinstance(vol,       (int,float)) else str(vol)
+            lines.append(
+                f"{sym}:\n"
+                f"  Price:      {usd_str} USD  /  {inr_str} INR\n"
+                f"  24h Change: {chg_str}\n"
+                f"  Market Cap: {mcap_str}\n"
+                f"  24h Volume: {vol_str}"
+            )
+        print(f"[crypto] CryptoCompare ✓ {symbols}")
+        return {
+            "source":  "CryptoCompare (live)",
+            "title":   "Live Cryptocurrency Prices",
+            "url":     "https://www.cryptocompare.com",
+            "content": "\n\n".join(lines),
+        }
+    except Exception as e:
+        print(f"[crypto] CryptoCompare failed: {e}")
+        return None
 
-# ── 3. wttr.in: live weather ──────────────────────────────────────────
+def search_crypto(query: str) -> dict | None:
+    """Try CoinGecko first, CryptoCompare as fallback."""
+    cg_ids, cc_syms = _detect_crypto_names(query)
+    if not cg_ids:
+        return None
+
+    result = _coingecko_prices(cg_ids)
+    if result:
+        return result
+
+    # CoinGecko failed — try CryptoCompare
+    if cc_syms:
+        return _cryptocompare_prices(cc_syms)
+    return None
+
+
+# ── 3. WEATHER (wttr.in) ──────────────────────────────────────────────
 def _detect_city(query: str) -> str | None:
     q = query.lower()
-    if not any(w in q for w in {"weather", "temperature", "forecast", "humidity", "rain", "wind", "climate"}):
+    if not any(w in q for w in {"weather","temperature","forecast","humidity","rain","wind","climate","hot","cold"}):
         return None
-    m = re.search(r'weather\s+(?:in|at|for|of)?\s*([A-Za-z][A-Za-z\s]{1,24})', query, re.IGNORECASE)
-    if m: return m.group(1).strip()
-    m = re.search(r'([A-Za-z][A-Za-z\s]{1,24})\s+weather', query, re.IGNORECASE)
-    if m: return m.group(1).strip()
-    m = re.search(r'(?:temperature|forecast|climate)\s+(?:in|of|at)?\s*([A-Za-z][A-Za-z\s]{1,24})', query, re.IGNORECASE)
-    if m: return m.group(1).strip()
+    for pat in [
+        r'weather\s+(?:in|at|for|of)?\s*([A-Za-z][A-Za-z\s]{1,24})',
+        r'([A-Za-z][A-Za-z\s]{1,24})\s+weather',
+        r'(?:temperature|forecast|climate)\s+(?:in|of|at)?\s*([A-Za-z][A-Za-z\s]{1,24})',
+        r'(?:how|what).{0,15}(?:hot|cold|warm|rain).{0,10}in\s+([A-Za-z][A-Za-z\s]{1,24})',
+    ]:
+        m = re.search(pat, query, re.IGNORECASE)
+        if m:
+            city = m.group(1).strip()
+            # Remove trailing question/filler words
+            city = re.sub(r'\b(today|now|currently|like|is|the|a|an)\b', '', city, flags=re.IGNORECASE).strip()
+            if len(city) > 1:
+                return city
     return None
 
 def search_weather(query: str) -> dict | None:
@@ -487,6 +600,7 @@ def search_weather(query: str) -> dict | None:
         humidity = cur.get("humidity",      "N/A")
         wind     = cur.get("windspeedKmph", "N/A")
         uv       = cur.get("uvIndex",       "N/A")
+        vis      = cur.get("visibility",    "N/A")
         forecast = []
         for day in d.get("weather", [])[:3]:
             date  = day.get("date", "")
@@ -501,7 +615,8 @@ def search_weather(query: str) -> dict | None:
             f"  Temperature: {temp_c}°C ({temp_f}°F)\n"
             f"  Feels like:  {feels}°C\n"
             f"  Humidity:    {humidity}%\n"
-            f"  Wind:        {wind} km/h\n"
+            f"  Wind speed:  {wind} km/h\n"
+            f"  Visibility:  {vis} km\n"
             f"  UV Index:    {uv}\n\n"
             f"3-Day Forecast:\n" + "\n".join(forecast)
         )
@@ -517,10 +632,9 @@ def search_weather(query: str) -> dict | None:
         return None
 
 
-# ── 4. Wikipedia: full article extract ───────────────────────────────
+# ── 4. WIKIPEDIA (full article extract) ──────────────────────────────
 def search_wikipedia(query: str) -> dict | None:
     try:
-        # Search for best title
         r = requests.get(
             "https://en.wikipedia.org/w/api.php",
             params={"action": "query", "list": "search", "srsearch": query,
@@ -535,7 +649,6 @@ def search_wikipedia(query: str) -> dict | None:
     except Exception as e:
         print(f"[wiki-search] {e}")
         return None
-
     try:
         r = requests.get(
             "https://en.wikipedia.org/w/api.php",
@@ -549,14 +662,10 @@ def search_wikipedia(query: str) -> dict | None:
         for page in pages.values():
             extract = page.get("extract", "")
             if extract and len(extract) > 80:
-                url = f"https://en.wikipedia.org/wiki/{requests.utils.quote(title.replace(' ', '_'))}"
+                url = f"https://en.wikipedia.org/wiki/{requests.utils.quote(title.replace(' ','_'))}"
                 print(f"[wiki] ✓ '{title}' ({len(extract)} chars)")
-                return {
-                    "source":  "Wikipedia",
-                    "title":   title,
-                    "url":     url,
-                    "content": extract,
-                }
+                return {"source": "Wikipedia", "title": title,
+                        "url": url, "content": extract}
     except Exception as e:
         print(f"[wiki-extract] {e}")
     return None
@@ -565,12 +674,11 @@ def search_wikipedia(query: str) -> dict | None:
 # ── 5. REST Countries ─────────────────────────────────────────────────
 def _detect_country(query: str) -> str | None:
     if not any(w in query.lower() for w in
-               {"capital", "population", "currency", "language", "country", "nation", "area"}):
+               {"capital","population","currency","language","country","nation","area","gdp"}):
         return None
     m = re.search(
         r'(?:of|in|about|for|capital of|population of|currency of)\s+'
-        r'([A-Z][a-z]+(?:\s[A-Z][a-z]+)?)', query
-    )
+        r'([A-Z][a-z]+(?:\s[A-Z][a-z]+)?)', query)
     if m: return m.group(1).strip()
     m = re.search(r'\b([A-Z][a-z]{3,})\b', query)
     if m: return m.group(1).strip()
@@ -598,9 +706,8 @@ def search_country(query: str) -> dict | None:
         area      = c.get("area", "N/A")
         currencies = ", ".join(
             f"{v.get('name','')} ({v.get('symbol','')})"
-            for v in c.get("currencies", {}).values()
-        ) or "N/A"
-        languages = ", ".join(c.get("languages", {}).values()) or "N/A"
+            for v in c.get("currencies", {}).values()) or "N/A"
+        languages  = ", ".join(c.get("languages", {}).values()) or "N/A"
         content = (
             f"Country: {common}\n"
             f"  Capital:    {capital}\n"
@@ -611,12 +718,8 @@ def search_country(query: str) -> dict | None:
             f"  Languages:  {languages}"
         )
         print(f"[country] ✓ {common}")
-        return {
-            "source":  "REST Countries",
-            "title":   f"Country: {common}",
-            "url":     "https://restcountries.com",
-            "content": content,
-        }
+        return {"source": "REST Countries", "title": f"Country: {common}",
+                "url": "https://restcountries.com", "content": content}
     except Exception as e:
         print(f"[country] failed: {e}")
         return None
@@ -624,12 +727,8 @@ def search_country(query: str) -> dict | None:
 
 # ── Master search runner ──────────────────────────────────────────────
 def run_search(query: str) -> list[dict]:
-    """
-    Run ALL applicable search sources.
-    Every source is tried independently — a failure in one doesn't stop others.
-    """
-    results:  list[dict] = []
-    seen_keys: set[str]  = set()
+    results:   list[dict] = []
+    seen_keys: set[str]   = set()
 
     def add(item: dict | None):
         if not item:
@@ -639,56 +738,54 @@ def run_search(query: str) -> list[dict]:
             seen_keys.add(key)
             results.append(item)
 
-    add(search_crypto(query))    # live crypto prices
-    add(search_weather(query))   # live weather
-    add(search_country(query))   # country facts
-    add(search_news(query))      # RSS news — BBC, Reuters, TOI
-    add(search_wikipedia(query)) # full Wikipedia article
+    add(search_crypto(query))    # CoinGecko → CryptoCompare fallback
+    add(search_weather(query))   # wttr.in
+    add(search_country(query))   # REST Countries
+    add(search_reddit(query))    # Reddit JSON — news & current events
+    add(search_wikipedia(query)) # Wikipedia full extract
 
-    print(f"[search] total sources collected: {len(results)}")
+    print(f"[search] total sources: {len(results)}")
     return results
 
 
 def build_search_context(query: str, results: list[dict]) -> str:
     now_str = time.strftime("%d %b %Y %H:%M UTC", time.gmtime())
-
     if not results:
         return (
             "<search_results>\n"
             f"SEARCHED: {query}\n"
-            f"TIME:     {now_str}\n"
-            "RESULT:   No data found from any source.\n"
-            "INSTRUCTION: Tell the user you searched but found no current data. "
+            f"TIME: {now_str}\n"
+            "RESULT: No data found.\n"
+            "INSTRUCTION: Tell the user you searched but found nothing. "
             "Do NOT say 'I don't have real-time access'.\n"
             "</search_results>"
         )
-
     lines = [
         "<search_results>",
-        f"SEARCHED:       {query}",
-        f"RETRIEVED AT:   {now_str}",
-        f"SOURCES FOUND:  {len(results)}",
+        f"SEARCHED:     {query}",
+        f"RETRIEVED AT: {now_str}",
+        f"SOURCES:      {len(results)}",
         "",
     ]
     for i, r in enumerate(results, 1):
         lines += [
             f"━━━ SOURCE {i}: {r['source']} ━━━",
-            f"Title: {r['title']}",
-            f"URL:   {r['url']}",
+            f"Title:  {r['title']}",
+            f"URL:    {r['url']}",
             "",
             r["content"],
             "",
         ]
     lines += [
-        "━━━ END OF SEARCH RESULTS ━━━",
+        "━━━ END ━━━",
         "",
-        "CRITICAL INSTRUCTIONS:",
-        "- This data is REAL. It was fetched live moments ago.",
-        "- Use the exact numbers, names, and facts shown above.",
+        "CRITICAL INSTRUCTIONS FOR AI:",
+        "- This data is REAL and was fetched LIVE seconds ago.",
+        "- Use the exact prices, names, and facts shown above.",
         "- NEVER say 'I don't have real-time access'.",
-        "- NEVER say 'I cannot provide current prices' — prices are shown above.",
-        "- Cite sources naturally: 'According to CoinGecko...' or 'BBC reports that...'",
-        "- If nothing in the results answers the question, say 'I searched but couldn't find that specific information.'",
+        "- NEVER say 'I cannot provide current prices' — they are above.",
+        "- Cite naturally: 'According to CoinGecko, bitcoin is...'",
+        "- If the data doesn't answer, say 'I searched but couldn't find that specific info.'",
         "</search_results>",
     ]
     return "\n".join(lines)
@@ -706,7 +803,7 @@ IMAGE_GEN_RE = re.compile(
 
 IMAGE_DECLINE = (
     "I'm text-only — I can't generate images. 🙅\n\n"
-    "Try these free tools instead:\n"
+    "Try these free tools:\n"
     "• **[Adobe Firefly](https://firefly.adobe.com)** — free, high quality\n"
     "• **[Microsoft Designer](https://designer.microsoft.com)** — free with Microsoft account\n"
     "• **[Ideogram](https://ideogram.ai)** — great for text in images\n"
@@ -720,32 +817,32 @@ IMAGE_DECLINE = (
 SYSTEM = """You are Zippy, a smart AI assistant made by Arul Vethathiri.
 
 ## IDENTITY
-- Text-only AI. You CANNOT generate images.
+- Text-only AI. You cannot generate images.
 - Made by Arul Vethathiri, Class 11 student (2026).
 
 ## HOW TO USE SEARCH RESULTS
-When you see a <search_results> block in the message:
-- That data was fetched LIVE from the web moments ago. It is real and current.
-- Read the content carefully and use the actual figures and facts in your answer.
-- NEVER say "I don't have real-time access" — you have live data right there.
-- NEVER say "I cannot provide current prices" — the prices are in the data.
-- State numbers directly: "Bitcoin is currently $X according to CoinGecko."
-- If the data doesn't answer the question, say: "I searched but couldn't find that."
+When you see a <search_results> block:
+- That data was fetched LIVE from the web seconds ago. It is real.
+- Use the exact numbers, prices, and facts in your answer.
+- NEVER say "I don't have real-time access" — you have the data right there.
+- NEVER say "I cannot provide current prices" — they are shown above.
+- State answers directly: "Bitcoin is currently $X per CoinGecko."
+- If data doesn't answer the question: "I searched but couldn't find that."
 
 ## TONE
 - Smart, calm, friendly — like a knowledgeable friend.
-- Natural and conversational. Not corporate or stiff.
+- Conversational. Not corporate. Not over-excited.
 - Short greetings: one sentence only.
 
 ## RULES
 1. Answer exactly what was asked. Nothing extra.
 2. Prices/numbers → give them in the FIRST sentence.
 3. Simple questions → 1-3 sentences max.
-4. Explanations → short bullet points, no long intro.
-5. Code → give it directly, minimal comments.
+4. Explanations → short bullets, no long intro.
+5. Code → give it directly, brief comments.
 6. Math → show steps briefly.
 7. Creative → complete the piece, no preamble.
-8. FORBIDDEN phrases: "Certainly!", "Great question!", "As an AI",
+8. FORBIDDEN: "Certainly!", "Great question!", "As an AI",
    "I don't have real-time access", "my training data", "I'd be happy to".
 9. Never repeat the question.
 10. End with exactly 1 relevant emoji."""
@@ -755,7 +852,7 @@ When you see a <search_results> block in the message:
 # ─────────────────────────────────────────────────────────────────────
 IDENTITY = {
     "who are you":       "I'm Zippy, a text-based AI made by Arul Vethathiri! 🤖",
-    "what are you":      "I'm Zippy — a text-only AI assistant made by Arul Vethathiri. 🤖",
+    "what are you":      "I'm Zippy — a text-only AI made by Arul Vethathiri. 🤖",
     "who made you":      "Arul Vethathiri, a Class 11 student. 👨‍💻",
     "who created you":   "I was created by Arul Vethathiri. 👨‍💻",
     "who built you":     "Built by Arul Vethathiri. 👨‍💻",
@@ -763,7 +860,7 @@ IDENTITY = {
     "what can you do": (
         "I can answer questions, help with code, explain concepts, do maths, "
         "write content, and search the web for live prices, weather, and news. "
-        "I can't generate images though. 💬"
+        "I can't generate images. 💬"
     ),
     "are you an ai":  "Yes — Zippy AI, made by Arul Vethathiri. 🤖",
     "are you human":  "Nope, I'm Zippy — an AI, but a capable one! 😄",
@@ -818,9 +915,9 @@ def chat(req: ChatRequest):
 
     text_lower = user_input.lower().strip()
 
-    # 2. Image request → decline immediately
+    # 2. Image → decline
     if IMAGE_GEN_RE.search(user_input):
-        return {"reply": IMAGE_DECLINE, "thinking": "Image request — text-only AI.",
+        return {"reply": IMAGE_DECLINE, "thinking": "Image request.",
                 "searched": False, "sources": [], "model_used": "static"}
 
     # 3. Static replies
@@ -831,7 +928,7 @@ def chat(req: ChatRequest):
         return {"reply": SOCIAL[text_lower], "thinking": "Social.",
                 "searched": False, "sources": [], "model_used": "static"}
 
-    # 4. Search decision — AI model + rules, OR logic
+    # 4. Decide search — AI model + rules, OR logic
     needs_search, search_query, reasoning = decide_search(user_input)
 
     # 5. Search
@@ -840,7 +937,7 @@ def chat(req: ChatRequest):
     search_sources: list[dict] = []
 
     if needs_search and search_query:
-        results = run_search(search_query)
+        results        = run_search(search_query)
         search_context = build_search_context(search_query, results)
         if results:
             searched       = True
@@ -851,13 +948,11 @@ def chat(req: ChatRequest):
 
     # 6. Build messages
     messages: list[dict] = [{"role": "system", "content": SYSTEM}]
-
     for h in req.history[-20:]:
         if isinstance(h, dict) and h.get("role") and h.get("content"):
             messages.append({"role": h["role"], "content": str(h["content"])[:1500]})
-
     final_user = (
-        f"{search_context}\n\nNow answer this using the data above:\n{user_input}"
+        f"{search_context}\n\nAnswer this using the data above:\n{user_input}"
         if search_context else user_input
     )
     messages.append({"role": "user", "content": final_user})
@@ -890,5 +985,5 @@ def chat(req: ChatRequest):
                 f"**Models tried:**\n{tried_lines}"
             ),
             "thinking":   "All models rate-limited.",
-            "searched":   False, "sources":    [], "model_used": "none",
+            "searched":   False, "sources": [], "model_used": "none",
         }
