@@ -733,7 +733,7 @@ def search_country(q: str) -> dict | None:
             f"  Population: {c.get('population',0):,}\n"
             f"  Region:     {c.get('region','N/A')} ({c.get('subregion','N/A')})\n"
             f"  Area:       {c.get('area','N/A')} km²\n"
-            f"  Currencies: {', '.join(f'{v.get(\"name\",\"\")} ({v.get(\"symbol\",\"\")})' for v in c.get('currencies',{}).values()) or 'N/A'}\n"
+            f"  Currencies: {', '.join(v.get('name','') + ' (' + v.get('symbol','') + ')' for v in c.get('currencies',{}).values()) or 'N/A'}\n"
             f"  Languages:  {', '.join(c.get('languages',{}).values()) or 'N/A'}")
         print(f"[country] ✓ {common}")
         return {"source":"REST Countries","title":f"Country: {common}",
