@@ -36,14 +36,16 @@ def current_year() -> int:
 # ─────────────────────────────────────────────────────────────────────
 #  API KEY POOL
 #  Reads keys from environment variables:
-#    GROQ_API_KEY  → key slot 0  (your original key)
+#    GROQ_API_KEY  → key slot 0  (original key)
 #    GROQ_KEY_1    → key slot 1
 #    GROQ_KEY_2    → key slot 2
+#    GROQ_KEY_3    → key slot 3
+#    GROQ_KEY_4    → key slot 4
 #
 #  Logic:
 #  • Try every model on key 0 first
-#  • If all models on key 0 are rate-limited → silently move to key 1
-#  • If all models on key 1 are rate-limited → silently move to key 2
+#  • If all models on key 0 are rate-limited → silently move to next key
+#  • Continues across all keys until one works
 #  • If all keys exhausted → wait for soonest recovery or return friendly error
 # ─────────────────────────────────────────────────────────────────────
 
@@ -53,6 +55,8 @@ def _load_keys() -> list[str]:
         os.environ.get("GROQ_API_KEY", ""),
         os.environ.get("GROQ_KEY_1",   ""),
         os.environ.get("GROQ_KEY_2",   ""),
+        os.environ.get("GROQ_KEY_3",   ""),
+        os.environ.get("GROQ_KEY_4",   ""),
     ]
     seen = set()
     keys = []
@@ -67,7 +71,7 @@ API_KEYS: list[str] = _load_keys()
 
 if not API_KEYS:
     raise RuntimeError(
-        "No API keys found. Set GROQ_API_KEY, GROQ_KEY_1, GROQ_KEY_2 "
+        "No API keys found. Set GROQ_API_KEY, GROQ_KEY_1 … GROQ_KEY_4 "
         "in Render environment variables."
     )
 
@@ -143,7 +147,7 @@ def fmt_wait(s: float) -> str:
 
 # ─────────────────────────────────────────────────────────────────────
 #  CORE CALLER
-#  For each key (0 → 1 → 2), tries every model in order.
+#  For each key (0 → 1 → … → N), tries every model in order.
 #  Moves to the next key only when ALL models on the current key fail.
 #  Errors are logged internally; the caller never sees model/key names.
 # ─────────────────────────────────────────────────────────────────────
@@ -290,6 +294,8 @@ NO SEARCH NEEDED (needs_search: false):
 • Creative writing: poems, essays, stories
 • Definitions of stable concepts
 • Grammar and translation
+• Image generation requests: draw, generate image, create picture, make a poster, etc.
+• Image capability questions: "can you draw", "can you generate images"
 
 When in doubt → search.
 
@@ -839,21 +845,28 @@ def build_context(q: str, results: list[dict]) -> str:
 
 # ─────────────────────────────────────────────────────────────────────
 #  IMAGE DETECTION
+#
+#  IMG_CAPABILITY_RE — "can you draw?", "are you able to make images?"
+#    → Zippy should answer YES without generating anything.
+#
+#  No hard block on image generation requests.  The AI handles them
+#  via [[IMAGE: prompt]] syntax (instructed in the system prompt).
 # ─────────────────────────────────────────────────────────────────────
-IMG_RE = re.compile(
-    r'\b(generate|create|make|draw|paint|design|produce|render)\b.{0,25}'
-    r'\b(image|picture|photo|illustration|artwork|graphic|wallpaper|logo|'
-    r'poster|banner|sketch|portrait|thumbnail)\b|^/imagine\b',
-    re.IGNORECASE)
 
-IMG_DECLINE = (
-    "I'm text-only — I can't generate images. 🙅\n\n"
-    "Try these free tools:\n"
-    "• **[Adobe Firefly](https://firefly.adobe.com)** — free, high quality\n"
-    "• **[Microsoft Designer](https://designer.microsoft.com)** — free with account\n"
-    "• **[Ideogram](https://ideogram.ai)** — great for text in images\n"
-    "• **[Craiyon](https://www.craiyon.com)** — free, no account needed\n\n"
-    "Want me to write a prompt for any of these? ✍️"
+# Pure capability question: no specific subject follows the draw/generate verb
+IMG_CAPABILITY_RE = re.compile(
+    r'^\s*(?:can you|do you|are you able to|could you|will you|'
+    r'is it possible to|do you support)\s+'
+    r'(?:draw|generate|create|make|produce|paint|design|render|'
+    r'sketch|illustrate)\s*'
+    r'(?:images?|pictures?|photos?|illustrations?|art(?:work)?|'
+    r'graphics?|visuals?)?\s*\??\s*$',
+    re.IGNORECASE,
+)
+
+IMG_CAPABILITY_REPLY = (
+    "Yes, I can generate images! 🎨 Just tell me what you'd like me to draw or create "
+    "and I'll get it done for you."
 )
 
 
@@ -875,8 +888,18 @@ def make_system(ctx: str = "") -> str:
 You are Zippy, a smart AI assistant made by Arul Vethathiri.
 
 ## IDENTITY
-- Text-only AI. You cannot generate images.
 - Made by Arul Vethathiri, Class 11 student ({yr}).
+- You CAN generate images. When asked, output exactly one tag like:
+  [[IMAGE: detailed descriptive image prompt here]]
+  Keep the rest of the reply very brief (one sentence max).
+  The UI will render the image automatically from that tag.
+
+## IMAGE GENERATION RULES
+- User asks for an image / drawing / illustration / poster / logo / wallpaper → output [[IMAGE: ...]]
+- User asks about your IMAGE CAPABILITY ("can you draw?", "are you able to generate images?") → answer YES warmly, do NOT output an [[IMAGE:...]] tag.
+- User says "regenerate", "make it again", "try again", "another one" → re-output [[IMAGE: ...]] using the SAME subject from the previous message context.
+- NEVER say "I can't generate images", "I'm text-only", or similar. You CAN.
+- FORBIDDEN phrases for images: "I'm unable to", "I cannot generate", "I don't have the ability".
 
 ## TONE
 - Smart, calm, friendly — like a knowledgeable friend.
@@ -897,6 +920,14 @@ You are Zippy, a smart AI assistant made by Arul Vethathiri.
    "I cannot provide current prices", "I'd be happy to".
 10. Never repeat the question.
 11. End with exactly 1 relevant emoji.
+
+## CODE EXECUTION — STDOUT FORMATTING
+When writing Python or other interactive code that uses input():
+- ALWAYS add \\n at the START of each input prompt so each prompt appears
+  on its own line in non-interactive output.
+  ✅ input('\\nEnter your choice (1-4): ')
+  ❌ input('Enter your choice (1-4): ')
+- This prevents prompts from running together in the STDOUT display.
 
 ## PETROL / DIESEL PRICES
 No real-time API exists for Indian fuel prices.
@@ -927,16 +958,16 @@ NEVER guess or invent a specific per-litre price.
 #  STATIC REPLIES
 # ─────────────────────────────────────────────────────────────────────
 IDENTITY = {
-    "who are you":       "I'm Zippy, a text-based AI made by Arul Vethathiri! 🤖",
-    "what are you":      "I'm Zippy — a text-only AI made by Arul Vethathiri. 🤖",
+    "who are you":       "I'm Zippy, an AI assistant made by Arul Vethathiri! 🤖",
+    "what are you":      "I'm Zippy — an AI made by Arul Vethathiri. 🤖",
     "who made you":      "Arul Vethathiri, a Class 11 student. 👨‍💻",
     "who created you":   "I was created by Arul Vethathiri. 👨‍💻",
     "who built you":     "Built by Arul Vethathiri. 👨‍💻",
     "what is your name": "I'm Zippy! 😊",
     "what can you do": (
         "I can answer questions, help with code, explain concepts, do maths, "
-        "write content, and search the web for live prices, weather, and news. "
-        "I can't generate images. 💬"
+        "write content, generate images, and search the web for live prices, "
+        "weather, and news. 💬"
     ),
     "are you an ai":  "Yes — Zippy AI, made by Arul Vethathiri. 🤖",
     "are you human":  "Nope, I'm Zippy — an AI, but a capable one! 😄",
@@ -995,15 +1026,18 @@ def chat(req: ChatRequest):
 
     tl = user_input.lower().strip()
 
-    if IMG_RE.search(user_input):
-        return {"reply": IMG_DECLINE, "thinking": "",
+    # ── Image capability question ("can you draw?" with no subject) ───
+    # Strip any frontend-injected system prefix before checking
+    tl_clean = re.sub(r'^\[System:.*?\]\s*', '', tl, flags=re.DOTALL).strip()
+    if IMG_CAPABILITY_RE.match(tl_clean):
+        return {"reply": IMG_CAPABILITY_REPLY, "thinking": "",
                 "searched": False, "sources": []}
 
-    if tl in IDENTITY:
-        return {"reply": IDENTITY[tl], "thinking": "",
+    if tl_clean in IDENTITY:
+        return {"reply": IDENTITY[tl_clean], "thinking": "",
                 "searched": False, "sources": []}
-    if tl in SOCIAL:
-        return {"reply": SOCIAL[tl], "thinking": "",
+    if tl_clean in SOCIAL:
+        return {"reply": SOCIAL[tl_clean], "thinking": "",
                 "searched": False, "sources": []}
 
     # Decide whether to search
