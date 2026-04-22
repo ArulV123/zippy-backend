@@ -400,7 +400,7 @@ def search_crypto(q: str) -> dict | None:
             lines = []
             for cid, info in data.items():
                 usd  = info.get("usd"); inr = info.get("inr")
-                chg  = info.get("usd_24h_change")
+                chg  = info.get("usd_24hr_change")
                 mcap = info.get("usd_market_cap"); vol = info.get("usd_24h_vol")
                 lines.append(
                     f"• {cid.capitalize()} — {now_utc_str()}\n"
@@ -849,8 +849,8 @@ def build_context(q: str, results: list[dict]) -> str:
 #  IMG_CAPABILITY_RE — "can you draw?", "are you able to make images?"
 #    → Zippy should answer YES without generating anything.
 #
-#  No hard block on image generation requests.  The AI handles them
-#  via [[IMAGE: prompt]] syntax (instructed in the system prompt).
+#  The key fix here is that webpage / UI / frontend / code requests are
+#  forced into text/code mode so they cannot be mistaken for image tasks.
 # ─────────────────────────────────────────────────────────────────────
 
 # Pure capability question: no specific subject follows the draw/generate verb
@@ -864,16 +864,29 @@ IMG_CAPABILITY_RE = re.compile(
     re.IGNORECASE,
 )
 
+# Requests that should never be treated as image-generation tasks.
+WEBPAGE_UI_RE = re.compile(
+    r'\b(?:webpage|web page|website|site|landing page|frontend|front end|ui|user interface|'
+    r'dashboard|app ui|application ui|layout|theme|style|styling|colors?|colour|palette|'
+    r'css|html|responsive|navbar|nav bar|footer|card|buttons?|design)\b',
+    re.IGNORECASE,
+)
+
 IMG_CAPABILITY_REPLY = (
     "Yes, I can generate images! 🎨 Just tell me what you'd like me to draw or create "
     "and I'll get it done for you."
 )
 
 
+def is_webpage_ui_request(text: str) -> bool:
+    """Return True for website/UI/frontend/code requests that must stay text-only."""
+    return bool(WEBPAGE_UI_RE.search(text))
+
+
 # ─────────────────────────────────────────────────────────────────────
 #  SYSTEM PROMPT
 # ─────────────────────────────────────────────────────────────────────
-def make_system(ctx: str = "") -> str:
+def make_system(ctx: str = "", user_input: str = "") -> str:
     td = today_str(); tu = now_utc_str(); yr = current_year()
     date_block = (
         f"╔═══════════════════════════════════════╗\n"
@@ -883,6 +896,19 @@ def make_system(ctx: str = "") -> str:
         f"╚═══════════════════════════════════════╝\n"
         f"USE THIS DATE. NEVER assume any other year or date."
     )
+
+    force_text_only = is_webpage_ui_request(user_input)
+    text_only_block = ""
+    if force_text_only:
+        text_only_block = """
+
+## HARD OVERRIDE FOR WEB / UI / FRONTEND REQUESTS
+- The user is asking about a webpage, website, UI, frontend, layout, styling, colors, or design.
+- NEVER output [[IMAGE: ...]] for this request.
+- Answer with code or text only.
+- If the request asks for a colorful or heavy visual webpage, interpret that as styling/CSS/layout, not as an image.
+"""
+
     base = f"""{date_block}
 
 You are Zippy, a smart AI assistant made by Arul Vethathiri.
@@ -946,7 +972,7 @@ When writing Python or other interactive code that uses input():
 ## PETROL / DIESEL PRICES
 No real-time API exists for Indian fuel prices.
 Tell the user the typical range and direct them to iocl.com or hpcl.com.
-NEVER guess or invent a specific per-litre price.
+NEVER guess or invent a specific per-litre price.{text_only_block}
 """
     if not ctx:
         return base
@@ -1039,6 +1065,7 @@ def chat(req: ChatRequest):
                 "thinking": "", "searched": False, "sources": []}
 
     tl = user_input.lower().strip()
+    force_text_only = is_webpage_ui_request(user_input)
 
     # ── Image capability question ("can you draw?" with no subject) ───
     # Strip any frontend-injected system prefix before checking
@@ -1070,7 +1097,7 @@ def chat(req: ChatRequest):
                        for r in results]
 
     # Build messages
-    system = make_system(ctx)
+    system = make_system(ctx, user_input)
     msgs   = [{"role": "system", "content": system}]
 
     for h in req.history[-20:]:
@@ -1082,6 +1109,12 @@ def chat(req: ChatRequest):
         if ctx else
         f"[Today is {today_str()}]\n\n{user_input}"
     )
+    if force_text_only:
+        user_msg = (
+            f"[Today is {today_str()}]\n"
+            f"[HARD RULE: This is a webpage / UI / frontend / styling request. Do NOT output [[IMAGE:...]].]\n\n"
+            f"{user_input}"
+        )
     msgs.append({"role": "user", "content": user_msg})
 
     try:
