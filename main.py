@@ -1,8 +1,8 @@
-python
+
 from fastapi import FastAPI
 from fastapi.middleware.cors import CORSMiddleware
 from pydantic import BaseModel
-from groq import Groq, RateLimitError, APIStatusError
+import Groq, RateLimitError, APIStatusError
 import requests
 import os
 import re
@@ -37,9 +37,7 @@ def current_year() -> int:
 # ─────────────────────────────────────────────────────────────────────
 #  API KEY POOL
 # ─────────────────────────────────────────────────────────────────────
-
 def _load_keys() -> list[str]:
-    """Load all API keys from environment, deduplicated, no blanks."""
     raw = [
         os.environ.get("GROQ_API_KEY", ""),
         os.environ.get("GROQ_KEY_1",   ""),
@@ -65,7 +63,6 @@ if not API_KEYS:
     )
 
 print(f"[keys] Loaded {len(API_KEYS)} key(s)")
-
 _clients: list[Groq] = [Groq(api_key=k) for k in API_KEYS]
 
 
@@ -80,18 +77,17 @@ CHAT_MODELS = [
     {"id": "llama3-8b-8192",          "name": "Model E"},
 ]
 
+# Fast small models only — thinking should be cheap and quick
 THINK_MODELS = [
     {"id": "llama-3.1-8b-instant",    "name": "Model B"},
     {"id": "gemma2-9b-it",            "name": "Model C"},
     {"id": "llama3-8b-8192",          "name": "Model E"},
-    {"id": "llama-3.3-70b-versatile", "name": "Model A"},
 ]
 
 
 # ─────────────────────────────────────────────────────────────────────
 #  COOLDOWN TRACKER
 # ─────────────────────────────────────────────────────────────────────
-
 cooldown: dict[tuple[int, str], float] = {}
 
 def _is_available(key_idx: int, mid: str) -> bool:
@@ -102,7 +98,6 @@ def _mark_limited(key_idx: int, mid: str, wait_sec: float):
     print(f"[rl] key{key_idx} / {mid} blocked {wait_sec:.0f}s")
 
 def _parse_wait(exc: Exception) -> float:
-    """Extract retry-after seconds from Groq rate limit error message."""
     try:
         msg = str(exc)
         m = re.search(r'(?:try again in|retry after)\s*([\d.]+)s', msg, re.IGNORECASE)
@@ -116,7 +111,6 @@ def _parse_wait(exc: Exception) -> float:
     return 62.0
 
 def _soonest_recovery(models: list[dict]) -> float:
-    """Seconds until any (key, model) pair becomes available. 0 if any is free now."""
     now = time.time()
     waits = []
     for ki in range(len(API_KEYS)):
@@ -134,7 +128,6 @@ def fmt_wait(s: float) -> str:
 # ─────────────────────────────────────────────────────────────────────
 #  CORE CALLER
 # ─────────────────────────────────────────────────────────────────────
-
 def call_models(
     messages: list[dict],
     models: list[dict],
@@ -142,11 +135,6 @@ def call_models(
     temperature: float = 0.65,
     top_p: float = 0.9,
 ) -> tuple[str, str]:
-    """
-    Try every model on every key.
-    Returns (reply_text, internal_model_id).
-    Raises RuntimeError with QUOTA_EXCEEDED prefix if everything fails.
-    """
     for ki, client in enumerate(_clients):
         for m in models:
             mid = m["id"]
@@ -174,7 +162,6 @@ def call_models(
             except Exception as e:
                 print(f"[err] key{ki} / {mid} → {type(e).__name__}: {e}")
 
-    # Everything exhausted
     soonest = _soonest_recovery(models)
     raise RuntimeError(f"QUOTA_EXCEEDED|{fmt_wait(soonest)}")
 
@@ -187,10 +174,6 @@ def call_patient(
     top_p: float = 0.9,
     max_wait: float = 50.0,
 ) -> tuple[str, str]:
-    """
-    Same as call_models but if everything is rate-limited,
-    waits up to max_wait seconds for the soonest slot and retries once.
-    """
     try:
         return call_models(messages, models, max_tokens, temperature, top_p)
     except RuntimeError as e:
@@ -236,167 +219,78 @@ app.add_middleware(
 
 
 # ─────────────────────────────────────────────────────────────────────
-#  ✅ IMPROVED IMAGE DECISION LOGIC
-#  Runs BEFORE LLM call — minimal quota usage
-# ─────────────────────────────────────────────────────────────────────
-
-# Pattern: capability question ONLY ("can you draw?" with no object/subject)
-IMG_CAPABILITY_ONLY = re.compile(
-    r'^\s*(?:can you|do you|are you able to|could you|will you|'
-    r'is it possible|do you support|can i|may i)\s+'
-    r'(?:draw|generate|create|make|produce|paint|design|render|'
-    r'sketch|illustrate|generate an image)\s*'
-    r'(?:images?|pictures?|photos?|art(?:work)?|graphics?|visuals?)?\s*\??\s*$',
-    re.IGNORECASE,
-)
-
-# Pattern: explicit image request with visual subject
-IMG_EXPLICIT_REQUEST = re.compile(
-    r'(?:draw|generate|create|make|paint|design|render|sketch|'
-    r'illustrate|show me|make an? |create an? |design an? |draw an? |'
-    r'paint an? |generate an? image of)'
-    r'(?:\s+(?:a|an|the|my|your|this|that))?\s+'
-    r'(?:'
-    r'(?:image|picture|photo|photograph|artwork|illustration|poster|'
-    r'wallpaper|banner|icon|avatar|logo|thumbnail|sketch|portrait|'
-    r'graphic|visual|drawing|painting|composition)'
-    r'|'
-    r'(?:[A-Za-z\s]+?)(?:image|picture|photo|photo|pic|draw|artwork)?\s*(?:\?|$)'
-    r')',
-    re.IGNORECASE,
-)
-
-# Pattern: BLOCK image generation (text-only requests)
-MUST_BE_TEXT_ONLY = re.compile(
-    r'\b(?:'
-    r'code|program|script|function|class|method|variable|html|css|javascript|'
-    r'python|java|c\+\+|php|ruby|go|rust|sql|json|xml|api|endpoint|'
-    r'webpage|website|web page|landing page|frontend|front-end|backend|back-end|'
-    r'dashboard|app ui|application|ui|user interface|layout|design|responsive|'
-    r'navbar|nav bar|footer|button|card|modal|form|table|menu|sidebar|'
-    r'write|compose|draft|essay|article|blog|story|poem|letter|email|'
-    r'explain|tutorial|guide|documentation|readme|summary|analysis|'
-    r'formula|equation|algorithm|logic|data|calculate|compute'
-    r')\b',
-    re.IGNORECASE,
-)
-
-# Pattern: Regenerate / try again with same subject
-IMG_REGEN = re.compile(
-    r'^\s*(?:try again|another one|different|again|redo|remake|new|again|'
-    r'once more|one more time|again please|try one more|different style|'
-    r'in a different style|make it|make another|create another|draw another)\s*\??\s*$',
-    re.IGNORECASE,
-)
-
-
-class ImageDecision:
-    """Encapsulates the image generation decision."""
-    def __init__(self, mode: str, reason: str = ""):
-        self.mode = mode  # "IMAGE", "TEXT_ONLY", or "NORMAL"
-        self.reason = reason
-        self.block_msg = ""
-    
-    def is_image(self) -> bool:
-        return self.mode == "IMAGE"
-    
-    def is_text_only(self) -> bool:
-        return self.mode == "TEXT_ONLY"
-    
-    def is_normal(self) -> bool:
-        return self.mode == "NORMAL"
-
-
-def decide_image_mode(text: str) -> ImageDecision:
-    """
-    Decide if this is an image request, text-only request, or normal conversation.
-    ⚠️ Runs BEFORE LLM call — minimal quota usage.
-    
-    Returns ImageDecision with mode: "IMAGE", "TEXT_ONLY", or "NORMAL"
-    """
-    clean = text.strip()
-    lo = clean.lower()
-    
-    # ── Step 1: Explicit image request with visual subject
-    if IMG_EXPLICIT_REQUEST.search(clean):
-        return ImageDecision("IMAGE", "Explicit image request detected")
-    
-    # ── Step 2: BLOCK if it's code/webpage/text content
-    if MUST_BE_TEXT_ONLY.search(clean):
-        return ImageDecision(
-            "TEXT_ONLY",
-            "Code/webpage/text request — no image generation",
-        )
-    
-    # ── Step 3: Capability question ONLY (can you draw?)
-    if IMG_CAPABILITY_ONLY.match(clean):
-        return ImageDecision(
-            "NORMAL",  # Special case handled separately in route
-            "Image capability question",
-        )
-    
-    # ── Step 4: Regenerate (try again)
-    if IMG_REGEN.match(clean):
-        return ImageDecision("IMAGE", "Regeneration request")
-    
-    # ── Default: Normal conversation
-    return ImageDecision("NORMAL", "Normal conversation")
-
-
-IMG_CAPABILITY_REPLY = (
-    "Yes, I can generate images! 🎨 Just tell me what you'd like me to draw or create "
-    "and I'll get it done for you."
-)
-
-
-# ─────────────────────────────────────────────────────────────────────
-#  THINKING PROMPT
+#  UNIFIED THINKING PROMPT
+#  One cheap call decides: search? + intent (image/code/text/chat)
 # ─────────────────────────────────────────────────────────────────────
 def make_think_prompt() -> str:
-    return f"""You are the search decision engine for Zippy AI.
+    return f"""You are the decision engine for Zippy AI.
 TODAY IS EXACTLY: {today_str()}
 CURRENT YEAR: {current_year()}
 
-Read the user message and decide: does answering it need LIVE internet data?
-
-Output ONLY raw JSON:
+Read the user message and output ONLY raw JSON:
 {{
   "needs_search": true or false,
-  "search_query": "short optimised query, empty if false",
-  "reasoning": "one sentence"
+  "search_query": "short optimised query, empty string if false",
+  "intent": "image" or "code" or "text" or "chat",
+  "reasoning": "one short sentence"
 }}
 
-SEARCH NEEDED (needs_search: true):
-• Any price: crypto, stocks, gold, silver, platinum, oil
-• Petrol / diesel / fuel prices anywhere
-• Currency exchange rates (USD/INR, dollar, forex)
+──────────── needs_search ────────────
+TRUE for:
+• Any live price: crypto, stocks, gold, silver, platinum, oil, petrol, diesel, fuel
+• Currency exchange rates (USD/INR, dollar, forex, conversion)
 • Weather or forecast for any city
 • Sports scores, match results, tournament winners
-• Recent or breaking news, current events
-• Elections, government changes, political events
+• Recent or breaking news, current events, elections, government changes
 • "Who is the current X" — any active role
 • Software releases: "latest version", "new update"
-• Questions mentioning today / now / currently / latest / this week / 2024 / 2025 / 2026
-• Any ongoing situation or event from 2023–{current_year()}
+• Questions with: today / now / currently / latest / this week / 2024 / 2025 / 2026
+• Any ongoing situation from 2023–{current_year()}
 
-NO SEARCH NEEDED (needs_search: false):
-• Normal conversation: greetings, jokes, small talk
-• Pure coding: syntax, algorithms, how to write code
-• Math problems and calculations
-• Science theory (concepts that don't change)
-• History before 2023
-• Creative writing: poems, essays, stories
-• Definitions of stable concepts
-• Grammar and translation
-• Image generation requests: draw, generate image, create picture, make a poster, etc.
-• Image capability questions: "can you draw", "can you generate images"
+FALSE for:
+• Greetings, jokes, small talk, thanks
+• Pure coding: syntax, algorithms, writing code, webpages, UIs
+• Math, science theory, history before 2023
+• Creative writing, definitions, grammar, translation
+• Image generation requests ("draw", "generate image", "create picture")
+• Image capability questions ("can you draw?")
 
-When in doubt → search.
+When in doubt → search (true).
 
-JSON ONLY:"""
+──────────── intent ────────────
+"image" → user explicitly asks for visual media:
+   draw, paint, generate image, create picture, make a poster, wallpaper,
+   illustration, logo, banner, sketch, portrait, thumbnail, artwork, photo of X.
+   Must have a clear visual SUBJECT (not just a capability question).
+   Examples: "draw a cat", "generate an image of a sunset", "make a poster of mars".
+
+"code" → user asks for code, website, webpage, UI, frontend, HTML, CSS,
+   JavaScript, Python, React, component, layout, styling, dashboard, landing page,
+   script, program, function, algorithm implementation, regex, SQL query.
+   Examples: "make a colorful webpage", "build a landing page", "write python to X",
+   "css for a dark button", "react component for login".
+
+"text" → user wants a written answer:
+   explanation, definition, essay, story, summary, tutorial, translation,
+   math problem, factual Q&A, live-data question (prices/weather/news).
+   Examples: "explain recursion", "stock price of HDFC", "who won the match".
+
+"chat" → greetings, thanks, small talk, identity questions, jokes.
+   Examples: "hi", "thanks", "who are you", "good night".
+
+CRITICAL DISAMBIGUATION:
+• "webpage with colors" / "colorful website" / "beautiful UI"  → intent=code (NOT image)
+• "can you draw?" / "do you generate images?"                  → intent=chat
+• "draw a red car" / "image of a cat"                          → intent=image
+• "code for a login page"                                      → intent=code
+• "explain how login works"                                    → intent=text
+• "stock price of X" / "weather in Y"                          → intent=text, needs_search=true
+
+Output ONLY the JSON, nothing else:"""
 
 
-def run_thinking(user_input: str, timeout: float = 9.0) -> dict:
+def run_thinking(user_input: str, timeout: float = 18.0) -> dict:
+    """Single cheap call → returns {needs_search, search_query, intent, reasoning}."""
     box: list[dict] = []
 
     def _call():
@@ -404,14 +298,22 @@ def run_thinking(user_input: str, timeout: float = 9.0) -> dict:
             raw, _ = call_models(
                 [{"role": "system", "content": make_think_prompt()},
                  {"role": "user",   "content": user_input}],
-                THINK_MODELS, max_tokens=130, temperature=0.0, top_p=1.0,
+                THINK_MODELS, max_tokens=140, temperature=0.0, top_p=1.0,
             )
             raw = re.sub(r"```(?:json)?|```", "", raw).strip()
             match = re.search(r'\{.*?\}', raw, re.DOTALL)
             if match:
                 p = json.loads(match.group(0))
-                if isinstance(p.get("needs_search"), bool):
-                    box.append(p)
+                # Validate shape
+                if not isinstance(p.get("needs_search"), bool):
+                    return
+                intent = str(p.get("intent", "text")).lower().strip()
+                if intent not in ("image", "code", "text", "chat"):
+                    intent = "text"
+                p["intent"] = intent
+                p["search_query"] = str(p.get("search_query", "") or "").strip()
+                p["reasoning"]    = str(p.get("reasoning", "") or "").strip()
+                box.append(p)
         except Exception as e:
             print(f"[think] err: {e}")
 
@@ -421,16 +323,22 @@ def run_thinking(user_input: str, timeout: float = 9.0) -> dict:
 
     if box:
         r = box[0]
-        print(f"[think] search={r['needs_search']} q='{r.get('search_query','')}'")
+        print(f"[think] intent={r['intent']} search={r['needs_search']} q='{r.get('search_query','')}'")
         return r
-    print("[think] timed out — default: no search")
-    return {"needs_search": False, "search_query": "", "reasoning": "Timed out."}
+
+    # Fallback when thinking genuinely timed out — be permissive, not restrictive
+    print("[think] timed out — permissive fallback")
+    return {
+        "needs_search": False,
+        "search_query": "",
+        "intent":       "text",
+        "reasoning":    "Decision engine timed out; defaulting to plain text reply.",
+    }
 
 
 # ─────────────────────────────────────────────────────────────────────
-#  SEARCH SOURCES (KEEP ALL EXISTING)
+#  SEARCH SOURCES  (UNCHANGED)
 # ─────────────────────────────────────────────────────────────────────
-
 BASE_H = {
     "User-Agent": "Mozilla/5.0 (compatible; ZippyAI/2.0)",
     "Accept":     "application/json, text/html, */*",
@@ -458,7 +366,6 @@ def _f(val, pre="$", dp=2) -> str:
     return f"{pre}{val:,.{dp}f}" if val >= 0.01 else f"{pre}{val:.6f}"
 
 
-# ── CRYPTO ────────────────────────────────────────────────────────────
 CRYPTO_CG = {
     "bitcoin":"bitcoin","btc":"bitcoin","ethereum":"ethereum","eth":"ethereum",
     "dogecoin":"dogecoin","doge":"dogecoin","solana":"solana","sol":"solana",
@@ -534,7 +441,6 @@ def search_crypto(q: str) -> dict | None:
     return None
 
 
-# ── METALS ────────────────────────────────────────────────────────────
 def search_metals(q: str) -> dict | None:
     lo = q.lower()
     metals = [m for m in ["gold", "silver", "platinum", "palladium"] if m in lo]
@@ -571,7 +477,6 @@ def search_metals(q: str) -> dict | None:
         print(f"[metals] {e}"); return None
 
 
-# ── FOREX ─────────────────────────────────────────────────────────────
 FX_NAMES = {
     "dollar": "USD", "usd": "USD", "us dollar": "USD", "american dollar": "USD",
     "rupee": "INR", "inr": "INR", "indian rupee": "INR",
@@ -623,7 +528,6 @@ def search_forex(q: str) -> dict | None:
         print(f"[forex] {e}"); return None
 
 
-# ── PETROL / DIESEL ───────────────────────────────────────────────────
 FUEL_WORDS = {"petrol", "diesel", "fuel", "lpg", "cng", "gas price", "gasoline"}
 
 def search_fuel(q: str) -> dict | None:
@@ -645,7 +549,6 @@ def search_fuel(q: str) -> dict | None:
             "url": "https://iocl.com", "content": content}
 
 
-# ── WEATHER ───────────────────────────────────────────────────────────
 def _city(q: str) -> str | None:
     lo = q.lower()
     if not any(w in lo for w in {"weather", "temperature", "forecast", "humidity",
@@ -700,7 +603,6 @@ def search_weather(q: str) -> dict | None:
         print(f"[weather] {e}"); return None
 
 
-# ── NEWS ──────────────────────────────────────────────────────────────
 NEWS_MAX_AGE_DAYS = 7
 
 def _article_age_days(pub_date_str: str) -> float:
@@ -809,7 +711,6 @@ def search_news(q: str, max_results: int = 6) -> dict | None:
     }
 
 
-# ── WIKIPEDIA ─────────────────────────────────────────────────────────
 def search_wikipedia(q: str) -> dict | None:
     try:
         r = requests.get("https://en.wikipedia.org/w/api.php",
@@ -843,7 +744,6 @@ def search_wikipedia(q: str) -> dict | None:
     return None
 
 
-# ── REST COUNTRIES ────────────────────────────────────────────────────
 def search_country(q: str) -> dict | None:
     if not any(w in q.lower() for w in
                {"capital", "population", "currency", "language",
@@ -885,7 +785,6 @@ def search_country(q: str) -> dict | None:
         print(f"[country] {e}"); return None
 
 
-# ── MASTER SEARCH ─────────────────────────────────────────────────────
 def run_search(q: str) -> list[dict]:
     results: list[dict] = []; seen: set[str] = set()
 
@@ -939,18 +838,55 @@ def build_context(q: str, results: list[dict]) -> str:
 
 
 # ─────────────────────────────────────────────────────────────────────
-#  SYSTEM PROMPT (SIMPLIFIED IMAGE RULES)
+#  SYSTEM PROMPT  (intent-aware)
 # ─────────────────────────────────────────────────────────────────────
-def make_system(ctx: str = "", user_input: str = "") -> str:
+def make_system(ctx: str = "", intent: str = "text") -> str:
     td = today_str(); tu = now_utc_str(); yr = current_year()
     date_block = (
         f"╔═══════════════════════════════════════╗\n"
         f"║  TODAY:  {td:<31}║\n"
         f"║  TIME:   {tu:<31}║\n"
         f"║  YEAR:   {yr:<31}║\n"
-        f"╚═══════════════════════════════════════╝\n"
+        f"╚═══════════════════════════════════════════╝\n"
         f"USE THIS DATE. NEVER assume any other year or date."
     )
+
+    # Intent-specific override injected by the decision engine
+    intent_block = ""
+    if intent == "image":
+        intent_block = """
+
+## HARD RULE — THIS IS AN IMAGE REQUEST
+- The decision engine classified this as an IMAGE request.
+- You MUST output exactly one [[IMAGE: detailed vivid prompt]] tag first.
+- After the tag, add at most ONE short sentence (under 8 words).
+- Do NOT output code, HTML, CSS, markdown, or explanations.
+"""
+    elif intent == "code":
+        intent_block = """
+
+## HARD RULE — THIS IS A CODE / UI / WEBPAGE REQUEST
+- The decision engine classified this as a CODE request (includes websites, UIs, layouts, styling).
+- NEVER output [[IMAGE: ...]] for this request.
+- Answer with actual code (HTML / CSS / JS / Python / etc.) or technical text only.
+- If the user asks for a colorful or heavy visual webpage, interpret that as CSS/layout, NOT as an image.
+"""
+    elif intent == "chat":
+        intent_block = """
+
+## HARD RULE — THIS IS SMALL TALK
+- The decision engine classified this as casual chat / greeting / identity.
+- Reply with ONE short friendly sentence.
+- NEVER output [[IMAGE: ...]] or code.
+"""
+    else:  # text
+        intent_block = """
+
+## HARD RULE — THIS IS A TEXT ANSWER REQUEST
+- The decision engine classified this as a plain written answer.
+- NEVER output [[IMAGE: ...]] for this request.
+- Reply with text (explanation, facts, bullets for news, etc.).
+"""
 
     base = f"""{date_block}
 
@@ -958,79 +894,65 @@ You are Zippy, a smart AI assistant made by Arul Vethathiri.
 
 ## IDENTITY
 - Made by Arul Vethathiri, Class 11 student ({yr}).
-- You CAN generate images when explicitly asked.
-- Output: [[IMAGE: detailed image prompt]]
-- Keep reply to ONE sentence max after the tag.
+- You CAN generate images. When the intent is image, output exactly one tag:
+  [[IMAGE: detailed descriptive image prompt here]]
 
-## IMAGE GENERATION — STRICT RULES
-OUTPUT [[IMAGE: ...]] ONLY when user explicitly asks for visual media:
-  "draw", "generate image", "create a photo", "paint", "design", "sketch",
-  "make a picture", "render", "illustrate", "show me a visual of", etc.
-
-NEVER OUTPUT [[IMAGE: ...]] for:
-  ✗ Code (HTML, CSS, Python, JavaScript, etc.) → write CODE
-  ✗ Webpage / UI / design layouts → write CODE/CSS
-  ✗ Text content (essays, stories, explanations) → write TEXT
-  ✗ Data / analysis / calculations → write TEXT
-  ✗ Capability questions ("can you draw?") → answer YES, no tag
-
-When you OUTPUT an image:
-  1. Put tag FIRST: [[IMAGE: detailed prompt here]]
-  2. Follow with ONE sentence max (under 8 words)
-  3. Example: [[IMAGE: red sports car on sunset mountain road]] Done! 🎨
-
-Regeneration ("try again", "another one"):
-  1. OUTPUT: [[IMAGE: same subject in different style]]
-  2. ONE sentence follow-up
-
-FORBIDDEN PHRASES:
-  ✗ "I can't generate images"
-  ✗ "I'm unable to create images"
-  ✗ "I don't have the ability"
-  ✗ "As an AI, I cannot..."
+## IMAGE GENERATION RULES
+- Only emit [[IMAGE: ...]] when the HARD RULE above says this is an image request.
+- Tag comes FIRST, then at most ONE short sentence (under 8 words).
+- Good: [[IMAGE: red sports car on mountain road at sunset]] Done! 🎨
+- Bad: "Sure! Here is your image. [[IMAGE: ...]] I hope you like it!"
+- NEVER say "I can't generate images". FORBIDDEN: "I'm unable to", "I cannot generate".
 
 ## TONE
-- Smart, calm, friendly — like a helpful friend
-- Conversational, not corporate
-- No excessive excitement or empty hype
+- Smart, calm, friendly — like a knowledgeable friend.
+- Conversational. Not corporate. Not over-excited.
+- Greetings: one short sentence only.
 
 ## RESPONSE RULES
-1. Answer EXACTLY what was asked. No padding.
-2. Prices/numbers → state in FIRST sentence
-3. Simple questions → 1-3 sentences max
-4. News → ALWAYS use bullet points
-5. Code → provide directly with brief comments
-6. Math → show steps briefly
-7. Creative → complete the piece, no intro
-8. Greetings → one short sentence
-9. Never repeat the user's question
-10. End with exactly ONE relevant emoji
+1. Answer exactly what was asked. Nothing extra.
+2. Prices/numbers → state them in the VERY FIRST sentence.
+3. Simple questions → 1-3 sentences max.
+4. News / current events → ALWAYS bullet points, one per story.
+5. Explanations → short bullets or brief paragraphs.
+6. Code → give directly with brief comments.
+7. Math → show steps briefly.
+8. Creative → complete the piece, no preamble.
+9. FORBIDDEN phrases: "Certainly!", "Great question!", "As an AI",
+   "I don't have real-time access", "my training data is limited",
+   "I cannot provide current prices", "I'd be happy to".
+10. Never repeat the question.
+11. End with exactly 1 relevant emoji.
 
-## CODE EXECUTION — STDIN FORMATTING
-When writing interactive Python code with input():
-✅ CORRECT: input('\\nEnter your choice: ')
-❌ WRONG:   input('Enter your choice: ')
-Always add \\n at the START of prompts.
+## CODE EXECUTION — STDOUT FORMATTING
+When writing Python or other interactive code that uses input():
+- ALWAYS add \\n at the START of each input prompt so each prompt appears
+  on its own line in non-interactive output.
+  ✅ input('\\nEnter your choice (1-4): ')
+  ❌ input('Enter your choice (1-4): ')
 
 ## PETROL / DIESEL PRICES
-No real-time API. Tell users the typical range and direct to iocl.com.
-NEVER invent specific per-litre prices.
+No real-time API exists for Indian fuel prices.
+Tell the user the typical range and direct them to iocl.com or hpcl.com.
+NEVER guess or invent a specific per-litre price.{intent_block}
 """
     if not ctx:
         return base
     return base + f"""
 
-## ⚠ LIVE DATA BELOW — MANDATORY TO USE ⚠
+## ⚠ LIVE DATA BELOW — YOU MUST USE THIS ⚠
 
 {ctx}
 
-## HOW TO USE LIVE DATA
-- READ every source carefully. Use exact figures.
-- NEVER say 'I don't have real-time access'
-- NEVER say 'I cannot provide current prices'
-- For news: present as bullet points
+## HOW TO USE THE LIVE DATA
+- READ every source carefully. The exact figures are there.
+- Use those exact numbers — do not use training-data estimates.
+- State today's date as {td} if asked.
+- NEVER say 'I don't have real-time access'.
+- NEVER say 'I cannot provide current prices'.
+- If fuel data says "no live data", tell the user honestly and give the URL.
+- For news: present as bullet points.
 - Cite sources naturally: "According to CoinGecko..." or "Google News reports..."
-- Date: {td}
 """
 
 
@@ -1105,85 +1027,46 @@ def chat(req: ChatRequest):
                 "thinking": "", "searched": False, "sources": []}
 
     tl = user_input.lower().strip()
+    tl_clean = re.sub(r'^\[System:.*?\]\s*', '', tl, flags=re.DOTALL).strip()
 
-    # ══════════════════════════════════════════════════════════════════
-    #  ✅ STEP 1: DECIDE IMAGE MODE (BEFORE any LLM call)
-    # ══════════════════════════════════════════════════════════════════
-    img_decision = decide_image_mode(user_input)
-    print(f"[image-decision] mode={img_decision.mode} reason={img_decision.reason}")
-
-    # Capability question: answer immediately without LLM
-    if img_decision.is_normal() and IMG_CAPABILITY_ONLY.match(tl):
-        return {"reply": IMG_CAPABILITY_REPLY, "thinking": "",
+    if tl_clean in IDENTITY:
+        return {"reply": IDENTITY[tl_clean], "thinking": "",
+                "searched": False, "sources": []}
+    if tl_clean in SOCIAL:
+        return {"reply": SOCIAL[tl_clean], "thinking": "",
                 "searched": False, "sources": []}
 
-    # Identity / social check
-    if tl in IDENTITY:
-        return {"reply": IDENTITY[tl], "thinking": "",
-                "searched": False, "sources": []}
-    if tl in SOCIAL:
-        return {"reply": SOCIAL[tl], "thinking": "",
-                "searched": False, "sources": []}
+    # Single AI decision call: search? + intent
+    think        = run_thinking(user_input)
+    needs_search = think.get("needs_search", False)
+    intent       = think.get("intent", "text")
+    sq           = (think.get("search_query") or "").strip() or user_input
+    reasoning    = think.get("reasoning", "")
 
-    # ══════════════════════════════════════════════════════════════════
-    #  ✅ STEP 2: SEARCH DECISION (if not an image request)
-    # ══════════════════════════════════════════════════════════════════
     ctx = ""; sources = []; found = False
+    if needs_search:
+        results = run_search(sq)
+        ctx     = build_context(sq, results)
+        if results:
+            found   = True
+            sources = [{"title": r["title"], "url": r["url"], "source": r["source"]}
+                       for r in results]
 
-    # Only search for non-image requests
-    if not img_decision.is_image():
-        think        = run_thinking(user_input)
-        needs_search = think.get("needs_search", False)
-        sq           = (think.get("search_query") or "").strip() or user_input
-        reasoning    = think.get("reasoning", "")
-
-        if needs_search:
-            results = run_search(sq)
-            ctx     = build_context(sq, results)
-            if results:
-                found   = True
-                sources = [{"title": r["title"], "url": r["url"], "source": r["source"]}
-                           for r in results]
-    else:
-        reasoning = img_decision.reason
-
-    # ══════════════════════════════════════════════════════════════════
-    #  ✅ STEP 3: BUILD MESSAGES
-    # ══════════════════════════════════════════════════════════════════
-    system = make_system(ctx, user_input)
+    # Build messages with intent-aware system prompt
+    system = make_system(ctx, intent)
     msgs   = [{"role": "system", "content": system}]
 
     for h in req.history[-20:]:
         if isinstance(h, dict) and h.get("role") and h.get("content"):
             msgs.append({"role": h["role"], "content": str(h["content"])[:1500]})
 
-    # Build user message with mode indicator
-    user_msg = f"[Today is {today_str()}]\n\n{user_input}"
-    
-    if img_decision.is_image():
-        user_msg = (
-            f"[Today is {today_str()}]\n"
-            f"[MODE: IMAGE GENERATION REQUEST]\n"
-            f"[User wants a visual. Output [[IMAGE: detailed prompt]] with ONE sentence.]\n\n"
-            f"{user_input}"
-        )
-    elif img_decision.is_text_only():
-        user_msg = (
-            f"[Today is {today_str()}]\n"
-            f"[MODE: TEXT/CODE ONLY]\n"
-            f"[HARD RULE: Do NOT output [[IMAGE: ...]]. Answer with code or text only.]\n\n"
-            f"{user_input}"
-        )
-    elif ctx:
-        user_msg = (
-            f"[Today is {today_str()}. Use live data from system context.]\n\n{user_input}"
-        )
-
+    user_msg = (
+        f"[Today is {today_str()}. Use live data from system context.]\n\n{user_input}"
+        if ctx else
+        f"[Today is {today_str()}]\n\n{user_input}"
+    )
     msgs.append({"role": "user", "content": user_msg})
 
-    # ══════════════════════════════════════════════════════════════════
-    #  ✅ STEP 4: CALL LLM
-    # ══════════════════════════════════════════════════════════════════
     try:
         reply, _ = call_patient(
             msgs, CHAT_MODELS,
