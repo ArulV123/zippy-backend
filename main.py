@@ -302,7 +302,30 @@ When in doubt → search.
 JSON ONLY:"""
 
 
-def run_thinking(user_input: str, timeout: float = 9.0) -> dict:
+LIVE_QUERY_HINTS = (
+    "price", "crypto", "stock", "stocks", "gold", "silver", "platinum", "oil",
+    "petrol", "diesel", "fuel", "weather", "forecast", "news", "latest", "recent",
+    "today", "now", "current", "breaking", "election", "sports", "score", "match",
+    "result", "winner", "update", "version", "this week", "2024", "2025", "2026",
+)
+
+
+def _looks_live_query(user_input: str) -> bool:
+    lo = user_input.lower()
+    return any(k in lo for k in LIVE_QUERY_HINTS)
+
+
+def _fallback_think(user_input: str) -> dict:
+    if _looks_live_query(user_input):
+        return {
+            "needs_search": True,
+            "search_query": user_input.strip(),
+            "reasoning": "Live-data fallback matched.",
+        }
+    return {"needs_search": False, "search_query": "", "reasoning": ""}
+
+
+def run_thinking(user_input: str, timeout: float = 7.0) -> dict:
     box: list[dict] = []
 
     def _call():
@@ -310,7 +333,7 @@ def run_thinking(user_input: str, timeout: float = 9.0) -> dict:
             raw, _ = call_models(
                 [{"role": "system", "content": make_think_prompt()},
                  {"role": "user",   "content": user_input}],
-                THINK_MODELS, max_tokens=130, temperature=0.0, top_p=1.0,
+                THINK_MODELS, max_tokens=48, temperature=0.0, top_p=1.0,
             )
             raw = re.sub(r"```(?:json)?|```", "", raw).strip()
             match = re.search(r'\{.*?\}', raw, re.DOTALL)
@@ -327,10 +350,17 @@ def run_thinking(user_input: str, timeout: float = 9.0) -> dict:
 
     if box:
         r = box[0]
+        if not r.get("needs_search") and _looks_live_query(user_input):
+            r = _fallback_think(user_input)
         print(f"[think] search={r['needs_search']} q='{r.get('search_query','')}'")
         return r
-    print("[think] timed out — default: no search")
-    return {"needs_search": False, "search_query": "", "reasoning": "Timed out."}
+
+    r = _fallback_think(user_input)
+    if r.get("needs_search"):
+        print(f"[think] fallback search q='{r.get('search_query','')}'")
+    else:
+        print("[think] fallback no-search")
+    return r
 
 
 # ─────────────────────────────────────────────────────────────────────
@@ -1030,6 +1060,8 @@ def chat(req: ChatRequest):
 
     # Decide whether to search
     think        = run_thinking(user_input)
+    if not think.get("needs_search", False) and _looks_live_query(user_input):
+        think = _fallback_think(user_input)
     needs_search = think.get("needs_search", False)
     sq           = (think.get("search_query") or "").strip() or user_input
     reasoning    = think.get("reasoning", "")
