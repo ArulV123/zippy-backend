@@ -39,15 +39,11 @@ def current_year() -> int:
 #    GROQ_API_KEY  → key slot 0  (your original key)
 #    GROQ_KEY_1    → key slot 1
 #    GROQ_KEY_2    → key slot 2
-#    GROQ_KEY_3    → key slot 3
-#    GROQ_KEY_4    → key slot 4
 #
 #  Logic:
 #  • Try every model on key 0 first
 #  • If all models on key 0 are rate-limited → silently move to key 1
 #  • If all models on key 1 are rate-limited → silently move to key 2
-#  • If all models on key 2 are rate-limited → silently move to key 3
-#  • If all models on key 3 are rate-limited → silently move to key 4
 #  • If all keys exhausted → wait for soonest recovery or return friendly error
 # ─────────────────────────────────────────────────────────────────────
 
@@ -57,8 +53,6 @@ def _load_keys() -> list[str]:
         os.environ.get("GROQ_API_KEY", ""),
         os.environ.get("GROQ_KEY_1",   ""),
         os.environ.get("GROQ_KEY_2",   ""),
-        os.environ.get("GROQ_KEY_3",   ""),
-        os.environ.get("GROQ_KEY_4",   ""),
     ]
     seen = set()
     keys = []
@@ -73,8 +67,8 @@ API_KEYS: list[str] = _load_keys()
 
 if not API_KEYS:
     raise RuntimeError(
-        "No API keys found. Set GROQ_API_KEY, GROQ_KEY_1, GROQ_KEY_2, "
-        "GROQ_KEY_3, GROQ_KEY_4 in Render environment variables."
+        "No API keys found. Set GROQ_API_KEY, GROQ_KEY_1, GROQ_KEY_2 "
+        "in Render environment variables."
     )
 
 print(f"[keys] Loaded {len(API_KEYS)} key(s)")
@@ -302,30 +296,7 @@ When in doubt → search.
 JSON ONLY:"""
 
 
-LIVE_QUERY_HINTS = (
-    "price", "crypto", "stock", "stocks", "gold", "silver", "platinum", "oil",
-    "petrol", "diesel", "fuel", "weather", "forecast", "news", "latest", "recent",
-    "today", "now", "current", "breaking", "election", "sports", "score", "match",
-    "result", "winner", "update", "version", "this week", "2024", "2025", "2026",
-)
-
-
-def _looks_live_query(user_input: str) -> bool:
-    lo = user_input.lower()
-    return any(k in lo for k in LIVE_QUERY_HINTS)
-
-
-def _fallback_think(user_input: str) -> dict:
-    if _looks_live_query(user_input):
-        return {
-            "needs_search": True,
-            "search_query": user_input.strip(),
-            "reasoning": "Live-data fallback matched.",
-        }
-    return {"needs_search": False, "search_query": "", "reasoning": ""}
-
-
-def run_thinking(user_input: str, timeout: float = 7.0) -> dict:
+def run_thinking(user_input: str, timeout: float = 9.0) -> dict:
     box: list[dict] = []
 
     def _call():
@@ -333,7 +304,7 @@ def run_thinking(user_input: str, timeout: float = 7.0) -> dict:
             raw, _ = call_models(
                 [{"role": "system", "content": make_think_prompt()},
                  {"role": "user",   "content": user_input}],
-                THINK_MODELS, max_tokens=48, temperature=0.0, top_p=1.0,
+                THINK_MODELS, max_tokens=130, temperature=0.0, top_p=1.0,
             )
             raw = re.sub(r"```(?:json)?|```", "", raw).strip()
             match = re.search(r'\{.*?\}', raw, re.DOTALL)
@@ -350,17 +321,10 @@ def run_thinking(user_input: str, timeout: float = 7.0) -> dict:
 
     if box:
         r = box[0]
-        if not r.get("needs_search") and _looks_live_query(user_input):
-            r = _fallback_think(user_input)
         print(f"[think] search={r['needs_search']} q='{r.get('search_query','')}'")
         return r
-
-    r = _fallback_think(user_input)
-    if r.get("needs_search"):
-        print(f"[think] fallback search q='{r.get('search_query','')}'")
-    else:
-        print("[think] fallback no-search")
-    return r
+    print("[think] timed out — default: no search")
+    return {"needs_search": False, "search_query": "", "reasoning": "Timed out."}
 
 
 # ─────────────────────────────────────────────────────────────────────
@@ -883,29 +847,8 @@ IMG_RE = re.compile(
     re.IGNORECASE)
 
 IMG_DECLINE = (
-    "I'm text-only — I can't generate images. 🙅\n\n"
-    "Try these free tools:\n"
-    "• **[Adobe Firefly](https://firefly.adobe.com)** — free, high quality\n"
-    "• **[Microsoft Designer](https://designer.microsoft.com)** — free with account\n"
-    "• **[Ideogram](https://ideogram.ai)** — great for text in images\n"
-    "• **[Craiyon](https://www.craiyon.com)** — free, no account needed\n\n"
-    "Want me to write a prompt for any of these? ✍️"
+    "Use [[IMAGE: ...]] for image requests so the front-end generator can run it. 🎨"
 )
-
-
-def _image_prompt_from_user(user_input: str) -> str:
-    prompt = re.sub(r'\s+', ' ', user_input or '').strip()
-    prompt = re.sub(r'^\s*/imagine\s*', '', prompt, flags=re.IGNORECASE)
-    prompt = re.sub(
-        r'^\s*(?:please\s+)?(?:generate|create|make|draw|paint|design|produce|render)\s+'
-        r'(?:me\s+)?(?:an?\s+)?(?:image|picture|photo|illustration|artwork|graphic|wallpaper|logo|'
-        r'poster|banner|sketch|portrait|thumbnail)\s*(?:of|for)?\s*',
-        '',
-        prompt,
-        flags=re.IGNORECASE,
-    ).strip()
-    prompt = prompt.strip(" \"'`")
-    return prompt or (user_input or '').strip()
 
 
 # ─────────────────────────────────────────────────────────────────────
@@ -926,7 +869,7 @@ def make_system(ctx: str = "") -> str:
 You are Zippy, a smart AI assistant made by Arul Vethathiri.
 
 ## IDENTITY
-- Text-only AI. You cannot generate images.
+- For image requests, return a compact tag exactly like [[IMAGE: detailed prompt]] so the front-end image generator can handle it.
 - Made by Arul Vethathiri, Class 11 student ({yr}).
 
 ## TONE
@@ -987,7 +930,7 @@ IDENTITY = {
     "what can you do": (
         "I can answer questions, help with code, explain concepts, do maths, "
         "write content, and search the web for live prices, weather, and news. "
-        "I can't generate images. 💬"
+        "For images, I can produce an image prompt tag. 💬"
     ),
     "are you an ai":  "Yes — Zippy AI, made by Arul Vethathiri. 🤖",
     "are you human":  "Nope, I'm Zippy — an AI, but a capable one! 😄",
@@ -1045,10 +988,10 @@ def chat(req: ChatRequest):
                 "thinking": "", "searched": False, "sources": []}
 
     tl = user_input.lower().strip()
+    is_title_request = tl.startswith('3-6 word title')
 
-    if IMG_RE.search(user_input):
-        prompt = _image_prompt_from_user(user_input)
-        return {"reply": f"[[IMAGE: {prompt}]]", "thinking": "",
+    if IMG_RE.search(user_input) and not is_title_request:
+        return {"reply": f"[[IMAGE: {user_input}]]", "thinking": "",
                 "searched": False, "sources": []}
 
     if tl in IDENTITY:
@@ -1060,8 +1003,6 @@ def chat(req: ChatRequest):
 
     # Decide whether to search
     think        = run_thinking(user_input)
-    if not think.get("needs_search", False) and _looks_live_query(user_input):
-        think = _fallback_think(user_input)
     needs_search = think.get("needs_search", False)
     sq           = (think.get("search_query") or "").strip() or user_input
     reasoning    = think.get("reasoning", "")
