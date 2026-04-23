@@ -1,3 +1,4 @@
+python
 from fastapi import FastAPI
 from fastapi.middleware.cors import CORSMiddleware
 from pydantic import BaseModel
@@ -35,18 +36,6 @@ def current_year() -> int:
 
 # ─────────────────────────────────────────────────────────────────────
 #  API KEY POOL
-#  Reads keys from environment variables:
-#    GROQ_API_KEY  → key slot 0  (original key)
-#    GROQ_KEY_1    → key slot 1
-#    GROQ_KEY_2    → key slot 2
-#    GROQ_KEY_3    → key slot 3
-#    GROQ_KEY_4    → key slot 4
-#
-#  Logic:
-#  • Try every model on key 0 first
-#  • If all models on key 0 are rate-limited → silently move to next key
-#  • Continues across all keys until one works
-#  • If all keys exhausted → wait for soonest recovery or return friendly error
 # ─────────────────────────────────────────────────────────────────────
 
 def _load_keys() -> list[str]:
@@ -77,7 +66,6 @@ if not API_KEYS:
 
 print(f"[keys] Loaded {len(API_KEYS)} key(s)")
 
-# One Groq client per key
 _clients: list[Groq] = [Groq(api_key=k) for k in API_KEYS]
 
 
@@ -102,10 +90,8 @@ THINK_MODELS = [
 
 # ─────────────────────────────────────────────────────────────────────
 #  COOLDOWN TRACKER
-#  Tracks when each (key_index, model_id) pair becomes available again.
 # ─────────────────────────────────────────────────────────────────────
 
-# cooldown[(key_idx, model_id)] = unix timestamp when available again
 cooldown: dict[tuple[int, str], float] = {}
 
 def _is_available(key_idx: int, mid: str) -> bool:
@@ -147,9 +133,6 @@ def fmt_wait(s: float) -> str:
 
 # ─────────────────────────────────────────────────────────────────────
 #  CORE CALLER
-#  For each key (0 → 1 → … → N), tries every model in order.
-#  Moves to the next key only when ALL models on the current key fail.
-#  Errors are logged internally; the caller never sees model/key names.
 # ─────────────────────────────────────────────────────────────────────
 
 def call_models(
@@ -168,7 +151,7 @@ def call_models(
         for m in models:
             mid = m["id"]
             if not _is_available(ki, mid):
-                continue   # this (key, model) is cooling — skip silently
+                continue
             try:
                 r = client.chat.completions.create(
                     model=mid,
@@ -183,16 +166,13 @@ def call_models(
             except RateLimitError as e:
                 wait = _parse_wait(e)
                 _mark_limited(ki, mid, wait)
-                # continue to next model on same key
 
             except APIStatusError as e:
                 _mark_limited(ki, mid, 15)
                 print(f"[api-err] key{ki} / {mid} → status {e.status_code}")
-                # continue to next model on same key
 
             except Exception as e:
                 print(f"[err] key{ki} / {mid} → {type(e).__name__}: {e}")
-                # continue to next model on same key
 
     # Everything exhausted
     soonest = _soonest_recovery(models)
@@ -237,7 +217,7 @@ def _warm_up():
                 max_tokens=1,
             )
             print(f"[warmup] ✓ key{ki} ready")
-            return   # one successful warm-up is enough
+            return
         except Exception as e:
             print(f"[warmup] key{ki}: {e}")
 
@@ -252,6 +232,120 @@ app.add_middleware(
     allow_origins=["*"],
     allow_methods=["*"],
     allow_headers=["*"],
+)
+
+
+# ─────────────────────────────────────────────────────────────────────
+#  ✅ IMPROVED IMAGE DECISION LOGIC
+#  Runs BEFORE LLM call — minimal quota usage
+# ─────────────────────────────────────────────────────────────────────
+
+# Pattern: capability question ONLY ("can you draw?" with no object/subject)
+IMG_CAPABILITY_ONLY = re.compile(
+    r'^\s*(?:can you|do you|are you able to|could you|will you|'
+    r'is it possible|do you support|can i|may i)\s+'
+    r'(?:draw|generate|create|make|produce|paint|design|render|'
+    r'sketch|illustrate|generate an image)\s*'
+    r'(?:images?|pictures?|photos?|art(?:work)?|graphics?|visuals?)?\s*\??\s*$',
+    re.IGNORECASE,
+)
+
+# Pattern: explicit image request with visual subject
+IMG_EXPLICIT_REQUEST = re.compile(
+    r'(?:draw|generate|create|make|paint|design|render|sketch|'
+    r'illustrate|show me|make an? |create an? |design an? |draw an? |'
+    r'paint an? |generate an? image of)'
+    r'(?:\s+(?:a|an|the|my|your|this|that))?\s+'
+    r'(?:'
+    r'(?:image|picture|photo|photograph|artwork|illustration|poster|'
+    r'wallpaper|banner|icon|avatar|logo|thumbnail|sketch|portrait|'
+    r'graphic|visual|drawing|painting|composition)'
+    r'|'
+    r'(?:[A-Za-z\s]+?)(?:image|picture|photo|photo|pic|draw|artwork)?\s*(?:\?|$)'
+    r')',
+    re.IGNORECASE,
+)
+
+# Pattern: BLOCK image generation (text-only requests)
+MUST_BE_TEXT_ONLY = re.compile(
+    r'\b(?:'
+    r'code|program|script|function|class|method|variable|html|css|javascript|'
+    r'python|java|c\+\+|php|ruby|go|rust|sql|json|xml|api|endpoint|'
+    r'webpage|website|web page|landing page|frontend|front-end|backend|back-end|'
+    r'dashboard|app ui|application|ui|user interface|layout|design|responsive|'
+    r'navbar|nav bar|footer|button|card|modal|form|table|menu|sidebar|'
+    r'write|compose|draft|essay|article|blog|story|poem|letter|email|'
+    r'explain|tutorial|guide|documentation|readme|summary|analysis|'
+    r'formula|equation|algorithm|logic|data|calculate|compute'
+    r')\b',
+    re.IGNORECASE,
+)
+
+# Pattern: Regenerate / try again with same subject
+IMG_REGEN = re.compile(
+    r'^\s*(?:try again|another one|different|again|redo|remake|new|again|'
+    r'once more|one more time|again please|try one more|different style|'
+    r'in a different style|make it|make another|create another|draw another)\s*\??\s*$',
+    re.IGNORECASE,
+)
+
+
+class ImageDecision:
+    """Encapsulates the image generation decision."""
+    def __init__(self, mode: str, reason: str = ""):
+        self.mode = mode  # "IMAGE", "TEXT_ONLY", or "NORMAL"
+        self.reason = reason
+        self.block_msg = ""
+    
+    def is_image(self) -> bool:
+        return self.mode == "IMAGE"
+    
+    def is_text_only(self) -> bool:
+        return self.mode == "TEXT_ONLY"
+    
+    def is_normal(self) -> bool:
+        return self.mode == "NORMAL"
+
+
+def decide_image_mode(text: str) -> ImageDecision:
+    """
+    Decide if this is an image request, text-only request, or normal conversation.
+    ⚠️ Runs BEFORE LLM call — minimal quota usage.
+    
+    Returns ImageDecision with mode: "IMAGE", "TEXT_ONLY", or "NORMAL"
+    """
+    clean = text.strip()
+    lo = clean.lower()
+    
+    # ── Step 1: Explicit image request with visual subject
+    if IMG_EXPLICIT_REQUEST.search(clean):
+        return ImageDecision("IMAGE", "Explicit image request detected")
+    
+    # ── Step 2: BLOCK if it's code/webpage/text content
+    if MUST_BE_TEXT_ONLY.search(clean):
+        return ImageDecision(
+            "TEXT_ONLY",
+            "Code/webpage/text request — no image generation",
+        )
+    
+    # ── Step 3: Capability question ONLY (can you draw?)
+    if IMG_CAPABILITY_ONLY.match(clean):
+        return ImageDecision(
+            "NORMAL",  # Special case handled separately in route
+            "Image capability question",
+        )
+    
+    # ── Step 4: Regenerate (try again)
+    if IMG_REGEN.match(clean):
+        return ImageDecision("IMAGE", "Regeneration request")
+    
+    # ── Default: Normal conversation
+    return ImageDecision("NORMAL", "Normal conversation")
+
+
+IMG_CAPABILITY_REPLY = (
+    "Yes, I can generate images! 🎨 Just tell me what you'd like me to draw or create "
+    "and I'll get it done for you."
 )
 
 
@@ -334,8 +428,9 @@ def run_thinking(user_input: str, timeout: float = 9.0) -> dict:
 
 
 # ─────────────────────────────────────────────────────────────────────
-#  SEARCH SOURCES
+#  SEARCH SOURCES (KEEP ALL EXISTING)
 # ─────────────────────────────────────────────────────────────────────
+
 BASE_H = {
     "User-Agent": "Mozilla/5.0 (compatible; ZippyAI/2.0)",
     "Accept":     "application/json, text/html, */*",
@@ -844,47 +939,7 @@ def build_context(q: str, results: list[dict]) -> str:
 
 
 # ─────────────────────────────────────────────────────────────────────
-#  IMAGE DETECTION
-#
-#  IMG_CAPABILITY_RE — "can you draw?", "are you able to make images?"
-#    → Zippy should answer YES without generating anything.
-#
-#  The key fix here is that webpage / UI / frontend / code requests are
-#  forced into text/code mode so they cannot be mistaken for image tasks.
-# ─────────────────────────────────────────────────────────────────────
-
-# Pure capability question: no specific subject follows the draw/generate verb
-IMG_CAPABILITY_RE = re.compile(
-    r'^\s*(?:can you|do you|are you able to|could you|will you|'
-    r'is it possible to|do you support)\s+'
-    r'(?:draw|generate|create|make|produce|paint|design|render|'
-    r'sketch|illustrate)\s*'
-    r'(?:images?|pictures?|photos?|illustrations?|art(?:work)?|'
-    r'graphics?|visuals?)?\s*\??\s*$',
-    re.IGNORECASE,
-)
-
-# Requests that should never be treated as image-generation tasks.
-WEBPAGE_UI_RE = re.compile(
-    r'\b(?:webpage|web page|website|site|landing page|frontend|front end|ui|user interface|'
-    r'dashboard|app ui|application ui|layout|theme|style|styling|colors?|colour|palette|'
-    r'css|html|responsive|navbar|nav bar|footer|card|buttons?|design)\b',
-    re.IGNORECASE,
-)
-
-IMG_CAPABILITY_REPLY = (
-    "Yes, I can generate images! 🎨 Just tell me what you'd like me to draw or create "
-    "and I'll get it done for you."
-)
-
-
-def is_webpage_ui_request(text: str) -> bool:
-    """Return True for website/UI/frontend/code requests that must stay text-only."""
-    return bool(WEBPAGE_UI_RE.search(text))
-
-
-# ─────────────────────────────────────────────────────────────────────
-#  SYSTEM PROMPT
+#  SYSTEM PROMPT (SIMPLIFIED IMAGE RULES)
 # ─────────────────────────────────────────────────────────────────────
 def make_system(ctx: str = "", user_input: str = "") -> str:
     td = today_str(); tu = now_utc_str(); yr = current_year()
@@ -897,100 +952,85 @@ def make_system(ctx: str = "", user_input: str = "") -> str:
         f"USE THIS DATE. NEVER assume any other year or date."
     )
 
-    force_text_only = is_webpage_ui_request(user_input)
-    text_only_block = ""
-    if force_text_only:
-        text_only_block = """
-
-## HARD OVERRIDE FOR WEB / UI / FRONTEND REQUESTS
-- The user is asking about a webpage, website, UI, frontend, layout, styling, colors, or design.
-- NEVER output [[IMAGE: ...]] for this request.
-- Answer with code or text only.
-- If the request asks for a colorful or heavy visual webpage, interpret that as styling/CSS/layout, not as an image.
-"""
-
     base = f"""{date_block}
 
 You are Zippy, a smart AI assistant made by Arul Vethathiri.
 
 ## IDENTITY
 - Made by Arul Vethathiri, Class 11 student ({yr}).
-- You CAN generate images. When asked, output exactly one tag like:
-  [[IMAGE: detailed descriptive image prompt here]]
-  Keep the rest of the reply very brief (one sentence max).
-  The UI will render the image automatically from that tag.
+- You CAN generate images when explicitly asked.
+- Output: [[IMAGE: detailed image prompt]]
+- Keep reply to ONE sentence max after the tag.
 
-## IMAGE GENERATION RULES
-ONLY output [[IMAGE: ...]] when the user EXPLICITLY asks for actual VISUAL MEDIA:
-  photo, picture, drawing, illustration, painting, artwork, poster, wallpaper,
-  logo, banner, sketch, portrait, thumbnail, graphic, or says "draw/paint/generate an image".
+## IMAGE GENERATION — STRICT RULES
+OUTPUT [[IMAGE: ...]] ONLY when user explicitly asks for visual media:
+  "draw", "generate image", "create a photo", "paint", "design", "sketch",
+  "make a picture", "render", "illustrate", "show me a visual of", etc.
 
-NEVER output [[IMAGE: ...]] for:
-  - Code / programming (HTML, CSS, Python, JavaScript, etc.) → write CODE instead
-  - Webpage / website / app / UI requests → write CODE instead
-  - Text content: essays, stories, explanations, tutorials → write TEXT instead
-  - Anything where the correct output is code or text
+NEVER OUTPUT [[IMAGE: ...]] for:
+  ✗ Code (HTML, CSS, Python, JavaScript, etc.) → write CODE
+  ✗ Webpage / UI / design layouts → write CODE/CSS
+  ✗ Text content (essays, stories, explanations) → write TEXT
+  ✗ Data / analysis / calculations → write TEXT
+  ✗ Capability questions ("can you draw?") → answer YES, no tag
 
-When you DO generate an image:
-  - Put [[IMAGE: detailed prompt]] with NO text BEFORE it — the tag comes first.
-  - After the tag, add at most ONE short sentence (under 8 words). Nothing more.
-  - Good example: [[IMAGE: red sports car on mountain road at sunset]] Done! 🎨
-  - Bad example: "Sure! Here is your image. [[IMAGE: ...]] I hope you like it!"
+When you OUTPUT an image:
+  1. Put tag FIRST: [[IMAGE: detailed prompt here]]
+  2. Follow with ONE sentence max (under 8 words)
+  3. Example: [[IMAGE: red sports car on sunset mountain road]] Done! 🎨
 
-Capability questions ("can you draw?") → answer YES warmly, no [[IMAGE:]] tag.
-Regenerate ("try again", "another one") → [[IMAGE: ...]] with same subject from context.
-NEVER say "I can't generate images". FORBIDDEN: "I'm unable to", "I cannot generate".
+Regeneration ("try again", "another one"):
+  1. OUTPUT: [[IMAGE: same subject in different style]]
+  2. ONE sentence follow-up
+
+FORBIDDEN PHRASES:
+  ✗ "I can't generate images"
+  ✗ "I'm unable to create images"
+  ✗ "I don't have the ability"
+  ✗ "As an AI, I cannot..."
 
 ## TONE
-- Smart, calm, friendly — like a knowledgeable friend.
-- Conversational. Not corporate. Not over-excited.
-- Greetings: one short sentence only.
+- Smart, calm, friendly — like a helpful friend
+- Conversational, not corporate
+- No excessive excitement or empty hype
 
 ## RESPONSE RULES
-1. Answer exactly what was asked. Nothing extra.
-2. Prices/numbers → state them in the VERY FIRST sentence.
-3. Simple questions → 1-3 sentences max.
-4. News / current events → ALWAYS bullet points, one per story.
-5. Explanations → short bullets or brief paragraphs.
-6. Code → give directly with brief comments.
-7. Math → show steps briefly.
-8. Creative → complete the piece, no preamble.
-9. FORBIDDEN phrases: "Certainly!", "Great question!", "As an AI",
-   "I don't have real-time access", "my training data is limited",
-   "I cannot provide current prices", "I'd be happy to".
-10. Never repeat the question.
-11. End with exactly 1 relevant emoji.
+1. Answer EXACTLY what was asked. No padding.
+2. Prices/numbers → state in FIRST sentence
+3. Simple questions → 1-3 sentences max
+4. News → ALWAYS use bullet points
+5. Code → provide directly with brief comments
+6. Math → show steps briefly
+7. Creative → complete the piece, no intro
+8. Greetings → one short sentence
+9. Never repeat the user's question
+10. End with exactly ONE relevant emoji
 
-## CODE EXECUTION — STDOUT FORMATTING
-When writing Python or other interactive code that uses input():
-- ALWAYS add \\n at the START of each input prompt so each prompt appears
-  on its own line in non-interactive output.
-  ✅ input('\\nEnter your choice (1-4): ')
-  ❌ input('Enter your choice (1-4): ')
-- This prevents prompts from running together in the STDOUT display.
+## CODE EXECUTION — STDIN FORMATTING
+When writing interactive Python code with input():
+✅ CORRECT: input('\\nEnter your choice: ')
+❌ WRONG:   input('Enter your choice: ')
+Always add \\n at the START of prompts.
 
 ## PETROL / DIESEL PRICES
-No real-time API exists for Indian fuel prices.
-Tell the user the typical range and direct them to iocl.com or hpcl.com.
-NEVER guess or invent a specific per-litre price.{text_only_block}
+No real-time API. Tell users the typical range and direct to iocl.com.
+NEVER invent specific per-litre prices.
 """
     if not ctx:
         return base
     return base + f"""
 
-## ⚠ LIVE DATA BELOW — YOU MUST USE THIS ⚠
+## ⚠ LIVE DATA BELOW — MANDATORY TO USE ⚠
 
 {ctx}
 
-## HOW TO USE THE LIVE DATA
-- READ every source carefully. The exact figures are there.
-- Use those exact numbers — do not use training-data estimates.
-- State today's date as {td} if asked.
-- NEVER say 'I don't have real-time access'.
-- NEVER say 'I cannot provide current prices'.
-- If fuel data says "no live data", tell the user honestly and give the URL.
-- For news: present as bullet points.
+## HOW TO USE LIVE DATA
+- READ every source carefully. Use exact figures.
+- NEVER say 'I don't have real-time access'
+- NEVER say 'I cannot provide current prices'
+- For news: present as bullet points
 - Cite sources naturally: "According to CoinGecko..." or "Google News reports..."
+- Date: {td}
 """
 
 
@@ -1065,38 +1105,51 @@ def chat(req: ChatRequest):
                 "thinking": "", "searched": False, "sources": []}
 
     tl = user_input.lower().strip()
-    force_text_only = is_webpage_ui_request(user_input)
 
-    # ── Image capability question ("can you draw?" with no subject) ───
-    # Strip any frontend-injected system prefix before checking
-    tl_clean = re.sub(r'^\[System:.*?\]\s*', '', tl, flags=re.DOTALL).strip()
-    if IMG_CAPABILITY_RE.match(tl_clean):
+    # ══════════════════════════════════════════════════════════════════
+    #  ✅ STEP 1: DECIDE IMAGE MODE (BEFORE any LLM call)
+    # ══════════════════════════════════════════════════════════════════
+    img_decision = decide_image_mode(user_input)
+    print(f"[image-decision] mode={img_decision.mode} reason={img_decision.reason}")
+
+    # Capability question: answer immediately without LLM
+    if img_decision.is_normal() and IMG_CAPABILITY_ONLY.match(tl):
         return {"reply": IMG_CAPABILITY_REPLY, "thinking": "",
                 "searched": False, "sources": []}
 
-    if tl_clean in IDENTITY:
-        return {"reply": IDENTITY[tl_clean], "thinking": "",
+    # Identity / social check
+    if tl in IDENTITY:
+        return {"reply": IDENTITY[tl], "thinking": "",
                 "searched": False, "sources": []}
-    if tl_clean in SOCIAL:
-        return {"reply": SOCIAL[tl_clean], "thinking": "",
+    if tl in SOCIAL:
+        return {"reply": SOCIAL[tl], "thinking": "",
                 "searched": False, "sources": []}
 
-    # Decide whether to search
-    think        = run_thinking(user_input)
-    needs_search = think.get("needs_search", False)
-    sq           = (think.get("search_query") or "").strip() or user_input
-    reasoning    = think.get("reasoning", "")
-
+    # ══════════════════════════════════════════════════════════════════
+    #  ✅ STEP 2: SEARCH DECISION (if not an image request)
+    # ══════════════════════════════════════════════════════════════════
     ctx = ""; sources = []; found = False
-    if needs_search:
-        results = run_search(sq)
-        ctx     = build_context(sq, results)
-        if results:
-            found   = True
-            sources = [{"title": r["title"], "url": r["url"], "source": r["source"]}
-                       for r in results]
 
-    # Build messages
+    # Only search for non-image requests
+    if not img_decision.is_image():
+        think        = run_thinking(user_input)
+        needs_search = think.get("needs_search", False)
+        sq           = (think.get("search_query") or "").strip() or user_input
+        reasoning    = think.get("reasoning", "")
+
+        if needs_search:
+            results = run_search(sq)
+            ctx     = build_context(sq, results)
+            if results:
+                found   = True
+                sources = [{"title": r["title"], "url": r["url"], "source": r["source"]}
+                           for r in results]
+    else:
+        reasoning = img_decision.reason
+
+    # ══════════════════════════════════════════════════════════════════
+    #  ✅ STEP 3: BUILD MESSAGES
+    # ══════════════════════════════════════════════════════════════════
     system = make_system(ctx, user_input)
     msgs   = [{"role": "system", "content": system}]
 
@@ -1104,19 +1157,33 @@ def chat(req: ChatRequest):
         if isinstance(h, dict) and h.get("role") and h.get("content"):
             msgs.append({"role": h["role"], "content": str(h["content"])[:1500]})
 
-    user_msg = (
-        f"[Today is {today_str()}. Use live data from system context.]\n\n{user_input}"
-        if ctx else
-        f"[Today is {today_str()}]\n\n{user_input}"
-    )
-    if force_text_only:
+    # Build user message with mode indicator
+    user_msg = f"[Today is {today_str()}]\n\n{user_input}"
+    
+    if img_decision.is_image():
         user_msg = (
             f"[Today is {today_str()}]\n"
-            f"[HARD RULE: This is a webpage / UI / frontend / styling request. Do NOT output [[IMAGE:...]].]\n\n"
+            f"[MODE: IMAGE GENERATION REQUEST]\n"
+            f"[User wants a visual. Output [[IMAGE: detailed prompt]] with ONE sentence.]\n\n"
             f"{user_input}"
         )
+    elif img_decision.is_text_only():
+        user_msg = (
+            f"[Today is {today_str()}]\n"
+            f"[MODE: TEXT/CODE ONLY]\n"
+            f"[HARD RULE: Do NOT output [[IMAGE: ...]]. Answer with code or text only.]\n\n"
+            f"{user_input}"
+        )
+    elif ctx:
+        user_msg = (
+            f"[Today is {today_str()}. Use live data from system context.]\n\n{user_input}"
+        )
+
     msgs.append({"role": "user", "content": user_msg})
 
+    # ══════════════════════════════════════════════════════════════════
+    #  ✅ STEP 4: CALL LLM
+    # ══════════════════════════════════════════════════════════════════
     try:
         reply, _ = call_patient(
             msgs, CHAT_MODELS,
@@ -1126,7 +1193,6 @@ def chat(req: ChatRequest):
                 "searched": found, "sources": sources}
 
     except RuntimeError as exc:
-        # Extract wait time from error — never expose internal names
         parts    = str(exc).split("|", 1)
         wait_str = parts[1].strip() if len(parts) == 2 else "a few minutes"
         return {
