@@ -302,38 +302,22 @@ When in doubt → search.
 JSON ONLY:"""
 
 
-LIVE_QUERY_HINTS = (
-    "price", "crypto", "stock", "stocks", "gold", "silver", "platinum", "oil",
-    "petrol", "diesel", "fuel", "weather", "forecast", "news", "latest", "recent",
-    "today", "now", "current", "breaking", "election", "sports", "score", "match",
-    "result", "winner", "update", "version", "this week", "2024", "2025", "2026",
-)
-
-
-def _looks_live_query(user_input: str) -> bool:
-    lo = user_input.lower()
-    return any(k in lo for k in LIVE_QUERY_HINTS)
-
-
-def _fallback_think(user_input: str) -> dict:
-    if _looks_live_query(user_input):
-        return {
-            "needs_search": True,
-            "search_query": user_input.strip(),
-            "reasoning": "Live-data fallback matched.",
-        }
-    return {"needs_search": False, "search_query": "", "reasoning": ""}
-
-
-def run_thinking(user_input: str, timeout: float = 7.0) -> dict:
+def run_thinking(user_input: str, timeout: float = 4.0) -> dict:
     box: list[dict] = []
+
+    def _fallback() -> dict:
+        text = user_input.lower()
+        news_like = bool(re.search(r"\b(news|latest|recent|today|current|update|breaking|election|result|score|match|weather|forecast|price|prices|crypto|stock|stocks|gold|silver|oil|currency|exchange|who is the current|current\s+\w+)\b", text))
+        if news_like:
+            return {"needs_search": True, "search_query": user_input, "reasoning": "Keyword fallback to live search."}
+        return {"needs_search": False, "search_query": "", "reasoning": "Heuristic fallback."}
 
     def _call():
         try:
             raw, _ = call_models(
                 [{"role": "system", "content": make_think_prompt()},
                  {"role": "user",   "content": user_input}],
-                THINK_MODELS, max_tokens=48, temperature=0.0, top_p=1.0,
+                THINK_MODELS, max_tokens=40, temperature=0.0, top_p=1.0,
             )
             raw = re.sub(r"```(?:json)?|```", "", raw).strip()
             match = re.search(r'\{.*?\}', raw, re.DOTALL)
@@ -350,16 +334,11 @@ def run_thinking(user_input: str, timeout: float = 7.0) -> dict:
 
     if box:
         r = box[0]
-        if not r.get("needs_search") and _looks_live_query(user_input):
-            r = _fallback_think(user_input)
         print(f"[think] search={r['needs_search']} q='{r.get('search_query','')}'")
         return r
 
-    r = _fallback_think(user_input)
-    if r.get("needs_search"):
-        print(f"[think] fallback search q='{r.get('search_query','')}'")
-    else:
-        print("[think] fallback no-search")
+    r = _fallback()
+    print(f"[think] fallback search={r['needs_search']} q='{r.get('search_query','')}'")
     return r
 
 
@@ -932,22 +911,23 @@ You are Zippy, a smart AI assistant made by Arul Vethathiri.
 ## TONE
 - Smart, calm, friendly — like a knowledgeable friend.
 - Conversational. Not corporate. Not over-excited.
-- Greetings: one short sentence only.
+- No greeting or intro for news/current-event answers.
 
 ## RESPONSE RULES
 1. Answer exactly what was asked. Nothing extra.
 2. Prices/numbers → state them in the VERY FIRST sentence.
 3. Simple questions → 1-3 sentences max.
-4. News / current events → ALWAYS bullet points, one per story.
+4. News / current events → start directly with bullet points, one per story, with no preamble or self-introduction.
 5. Explanations → short bullets or brief paragraphs.
 6. Code → give directly with brief comments.
 7. Math → show steps briefly.
 8. Creative → complete the piece, no preamble.
-9. FORBIDDEN phrases: "Certainly!", "Great question!", "As an AI",
+9. For live news/source replies, never include raw source URLs in the text; source cards are shown separately in the UI.
+10. FORBIDDEN phrases: "Certainly!", "Great question!", "As an AI",
    "I don't have real-time access", "my training data is limited",
    "I cannot provide current prices", "I'd be happy to".
-10. Never repeat the question.
-11. End with exactly 1 relevant emoji.
+11. Never repeat the question.
+12. End with exactly 1 relevant emoji.
 
 ## PETROL / DIESEL PRICES
 No real-time API exists for Indian fuel prices.
@@ -1060,8 +1040,6 @@ def chat(req: ChatRequest):
 
     # Decide whether to search
     think        = run_thinking(user_input)
-    if not think.get("needs_search", False) and _looks_live_query(user_input):
-        think = _fallback_think(user_input)
     needs_search = think.get("needs_search", False)
     sq           = (think.get("search_query") or "").strip() or user_input
     reasoning    = think.get("reasoning", "")
