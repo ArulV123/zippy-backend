@@ -302,22 +302,21 @@ When in doubt → search.
 JSON ONLY:"""
 
 
-def run_thinking(user_input: str, timeout: float = 4.0) -> dict:
-    box: list[dict] = []
+def run_thinking(user_input: str, timeout: float = 2.0) -> dict:
+    # Live/current queries should not wait on the model.
+    if _looks_live_query(user_input):
+        fb = _fallback_think(user_input)
+        print(f"[think] live fallback search={fb['needs_search']} q='{fb.get('search_query','')}'")
+        return fb
 
-    def _fallback() -> dict:
-        text = user_input.lower()
-        news_like = bool(re.search(r"\b(news|latest|recent|today|current|update|breaking|election|result|score|match|weather|forecast|price|prices|crypto|stock|stocks|gold|silver|oil|currency|exchange|who is the current|current\s+\w+)\b", text))
-        if news_like:
-            return {"needs_search": True, "search_query": user_input, "reasoning": "Keyword fallback to live search."}
-        return {"needs_search": False, "search_query": "", "reasoning": "Heuristic fallback."}
+    box: list[dict] = []
 
     def _call():
         try:
             raw, _ = call_models(
                 [{"role": "system", "content": make_think_prompt()},
                  {"role": "user",   "content": user_input}],
-                THINK_MODELS, max_tokens=40, temperature=0.0, top_p=1.0,
+                THINK_MODELS, max_tokens=24, temperature=0.0, top_p=1.0,
             )
             raw = re.sub(r"```(?:json)?|```", "", raw).strip()
             match = re.search(r'\{.*?\}', raw, re.DOTALL)
@@ -337,9 +336,9 @@ def run_thinking(user_input: str, timeout: float = 4.0) -> dict:
         print(f"[think] search={r['needs_search']} q='{r.get('search_query','')}'")
         return r
 
-    r = _fallback()
-    print(f"[think] fallback search={r['needs_search']} q='{r.get('search_query','')}'")
-    return r
+    fb = _fallback_think(user_input)
+    print(f"[think] fallback search={fb['needs_search']} q='{fb.get('search_query','')}'")
+    return fb
 
 
 # ─────────────────────────────────────────────────────────────────────
@@ -706,6 +705,7 @@ def search_news(q: str, max_results: int = 6) -> dict | None:
 
     header  = f"News for '{q}' — fetched {now_utc_str()}:\n"
     bullets = []
+    source_items: list[dict] = []
     for a in top:
         b = f"• **{a['title']}**"
         if a["desc"]: b += f"\n  {a['desc']}"
@@ -713,13 +713,20 @@ def search_news(q: str, max_results: int = 6) -> dict | None:
         if a["pub"]:  b += f"  |  Published: {a['pub']}"
         if a["link"]: b += f"\n  {a['link']}"
         bullets.append(b)
+        source_items.append({
+            "source": a["source"],
+            "title": a["title"],
+            "url": a["link"] or f"https://news.google.com/search?q={requests.utils.quote(q)}",
+            "content": a["desc"] or a["title"],
+        })
 
     print(f"[news] ✓ {len(top)} articles returned")
     return {
-        "source":  "Google News / TOI / The Hindu / Al Jazeera (live RSS)",
+        "source":  "Multi-source RSS",
         "title":   f"News: {q}",
         "url":     f"https://news.google.com/search?q={requests.utils.quote(q)}",
         "content": header + "\n\n".join(bullets),
+        "sources": source_items,
     }
 
 
@@ -806,7 +813,9 @@ def run_search(q: str) -> list[dict]:
     def add(item):
         if not item: return
         k = item.get("url") or item.get("title", "")
-        if k and k not in seen: seen.add(k); results.append(item)
+        if k and k not in seen:
+            seen.add(k)
+            results.append(item)
 
     add(search_crypto(q))
     add(search_metals(q))
@@ -814,7 +823,13 @@ def run_search(q: str) -> list[dict]:
     add(search_fuel(q))
     add(search_weather(q))
     add(search_country(q))
-    add(search_news(q))
+
+    news = search_news(q)
+    if news:
+        add(news)
+        for src in news.get("sources", []) or []:
+            add(src)
+
     add(search_wikipedia(q))
     print(f"[search] {len(results)} sources")
     return results
@@ -911,23 +926,22 @@ You are Zippy, a smart AI assistant made by Arul Vethathiri.
 ## TONE
 - Smart, calm, friendly — like a knowledgeable friend.
 - Conversational. Not corporate. Not over-excited.
-- No greeting or intro for news/current-event answers.
+- Greetings: one short sentence only.
 
 ## RESPONSE RULES
 1. Answer exactly what was asked. Nothing extra.
 2. Prices/numbers → state them in the VERY FIRST sentence.
 3. Simple questions → 1-3 sentences max.
-4. News / current events → start directly with bullet points, one per story, with no preamble or self-introduction.
+4. News / current events → ALWAYS bullet points, one per story.
 5. Explanations → short bullets or brief paragraphs.
 6. Code → give directly with brief comments.
 7. Math → show steps briefly.
 8. Creative → complete the piece, no preamble.
-9. For live news/source replies, never include raw source URLs in the text; source cards are shown separately in the UI.
-10. FORBIDDEN phrases: "Certainly!", "Great question!", "As an AI",
+9. FORBIDDEN phrases: "Certainly!", "Great question!", "As an AI",
    "I don't have real-time access", "my training data is limited",
    "I cannot provide current prices", "I'd be happy to".
-11. Never repeat the question.
-12. End with exactly 1 relevant emoji.
+10. Never repeat the question.
+11. End with exactly 1 relevant emoji.
 
 ## PETROL / DIESEL PRICES
 No real-time API exists for Indian fuel prices.
@@ -951,6 +965,7 @@ NEVER guess or invent a specific per-litre price.
 - If fuel data says "no live data", tell the user honestly and give the URL.
 - For news: present as bullet points.
 - Cite sources naturally: "According to CoinGecko..." or "Google News reports..."
+- For code requests, provide the complete working code in one file unless the user asks otherwise.
 """
 
 
