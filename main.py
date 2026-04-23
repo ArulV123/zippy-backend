@@ -302,13 +302,30 @@ When in doubt → search.
 JSON ONLY:"""
 
 
-def run_thinking(user_input: str, timeout: float = 2.0) -> dict:
-    # Live/current queries should not wait on the model.
-    if _looks_live_query(user_input):
-        fb = _fallback_think(user_input)
-        print(f"[think] live fallback search={fb['needs_search']} q='{fb.get('search_query','')}'")
-        return fb
+LIVE_QUERY_HINTS = (
+    "price", "crypto", "stock", "stocks", "gold", "silver", "platinum", "oil",
+    "petrol", "diesel", "fuel", "weather", "forecast", "news", "latest", "recent",
+    "today", "now", "current", "breaking", "election", "sports", "score", "match",
+    "result", "winner", "update", "version", "this week", "2024", "2025", "2026",
+)
 
+
+def _looks_live_query(user_input: str) -> bool:
+    lo = user_input.lower()
+    return any(k in lo for k in LIVE_QUERY_HINTS)
+
+
+def _fallback_think(user_input: str) -> dict:
+    if _looks_live_query(user_input):
+        return {
+            "needs_search": True,
+            "search_query": user_input.strip(),
+            "reasoning": "Live-data fallback matched.",
+        }
+    return {"needs_search": False, "search_query": "", "reasoning": ""}
+
+
+def run_thinking(user_input: str, timeout: float = 7.0) -> dict:
     box: list[dict] = []
 
     def _call():
@@ -316,7 +333,7 @@ def run_thinking(user_input: str, timeout: float = 2.0) -> dict:
             raw, _ = call_models(
                 [{"role": "system", "content": make_think_prompt()},
                  {"role": "user",   "content": user_input}],
-                THINK_MODELS, max_tokens=24, temperature=0.0, top_p=1.0,
+                THINK_MODELS, max_tokens=48, temperature=0.0, top_p=1.0,
             )
             raw = re.sub(r"```(?:json)?|```", "", raw).strip()
             match = re.search(r'\{.*?\}', raw, re.DOTALL)
@@ -333,12 +350,17 @@ def run_thinking(user_input: str, timeout: float = 2.0) -> dict:
 
     if box:
         r = box[0]
+        if not r.get("needs_search") and _looks_live_query(user_input):
+            r = _fallback_think(user_input)
         print(f"[think] search={r['needs_search']} q='{r.get('search_query','')}'")
         return r
 
-    fb = _fallback_think(user_input)
-    print(f"[think] fallback search={fb['needs_search']} q='{fb.get('search_query','')}'")
-    return fb
+    r = _fallback_think(user_input)
+    if r.get("needs_search"):
+        print(f"[think] fallback search q='{r.get('search_query','')}'")
+    else:
+        print("[think] fallback no-search")
+    return r
 
 
 # ─────────────────────────────────────────────────────────────────────
@@ -705,7 +727,6 @@ def search_news(q: str, max_results: int = 6) -> dict | None:
 
     header  = f"News for '{q}' — fetched {now_utc_str()}:\n"
     bullets = []
-    source_items: list[dict] = []
     for a in top:
         b = f"• **{a['title']}**"
         if a["desc"]: b += f"\n  {a['desc']}"
@@ -713,20 +734,13 @@ def search_news(q: str, max_results: int = 6) -> dict | None:
         if a["pub"]:  b += f"  |  Published: {a['pub']}"
         if a["link"]: b += f"\n  {a['link']}"
         bullets.append(b)
-        source_items.append({
-            "source": a["source"],
-            "title": a["title"],
-            "url": a["link"] or f"https://news.google.com/search?q={requests.utils.quote(q)}",
-            "content": a["desc"] or a["title"],
-        })
 
     print(f"[news] ✓ {len(top)} articles returned")
     return {
-        "source":  "Multi-source RSS",
+        "source":  "Google News / TOI / The Hindu / Al Jazeera (live RSS)",
         "title":   f"News: {q}",
         "url":     f"https://news.google.com/search?q={requests.utils.quote(q)}",
         "content": header + "\n\n".join(bullets),
-        "sources": source_items,
     }
 
 
@@ -813,9 +827,7 @@ def run_search(q: str) -> list[dict]:
     def add(item):
         if not item: return
         k = item.get("url") or item.get("title", "")
-        if k and k not in seen:
-            seen.add(k)
-            results.append(item)
+        if k and k not in seen: seen.add(k); results.append(item)
 
     add(search_crypto(q))
     add(search_metals(q))
@@ -823,13 +835,7 @@ def run_search(q: str) -> list[dict]:
     add(search_fuel(q))
     add(search_weather(q))
     add(search_country(q))
-
-    news = search_news(q)
-    if news:
-        add(news)
-        for src in news.get("sources", []) or []:
-            add(src)
-
+    add(search_news(q))
     add(search_wikipedia(q))
     print(f"[search] {len(results)} sources")
     return results
@@ -965,7 +971,6 @@ NEVER guess or invent a specific per-litre price.
 - If fuel data says "no live data", tell the user honestly and give the URL.
 - For news: present as bullet points.
 - Cite sources naturally: "According to CoinGecko..." or "Google News reports..."
-- For code requests, provide the complete working code in one file unless the user asks otherwise.
 """
 
 
@@ -1055,6 +1060,8 @@ def chat(req: ChatRequest):
 
     # Decide whether to search
     think        = run_thinking(user_input)
+    if not think.get("needs_search", False) and _looks_live_query(user_input):
+        think = _fallback_think(user_input)
     needs_search = think.get("needs_search", False)
     sq           = (think.get("search_query") or "").strip() or user_input
     reasoning    = think.get("reasoning", "")
