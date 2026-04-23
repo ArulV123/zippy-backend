@@ -39,11 +39,15 @@ def current_year() -> int:
 #    GROQ_API_KEY  → key slot 0  (your original key)
 #    GROQ_KEY_1    → key slot 1
 #    GROQ_KEY_2    → key slot 2
+#    GROQ_KEY_3    → key slot 3
+#    GROQ_KEY_4    → key slot 4
 #
 #  Logic:
 #  • Try every model on key 0 first
 #  • If all models on key 0 are rate-limited → silently move to key 1
 #  • If all models on key 1 are rate-limited → silently move to key 2
+#  • If all models on key 2 are rate-limited → silently move to key 3
+#  • If all models on key 3 are rate-limited → silently move to key 4
 #  • If all keys exhausted → wait for soonest recovery or return friendly error
 # ─────────────────────────────────────────────────────────────────────
 
@@ -53,6 +57,8 @@ def _load_keys() -> list[str]:
         os.environ.get("GROQ_API_KEY", ""),
         os.environ.get("GROQ_KEY_1",   ""),
         os.environ.get("GROQ_KEY_2",   ""),
+        os.environ.get("GROQ_KEY_3",   ""),
+        os.environ.get("GROQ_KEY_4",   ""),
     ]
     seen = set()
     keys = []
@@ -67,8 +73,8 @@ API_KEYS: list[str] = _load_keys()
 
 if not API_KEYS:
     raise RuntimeError(
-        "No API keys found. Set GROQ_API_KEY, GROQ_KEY_1, GROQ_KEY_2 "
-        "in Render environment variables."
+        "No API keys found. Set GROQ_API_KEY, GROQ_KEY_1, GROQ_KEY_2, "
+        "GROQ_KEY_3, GROQ_KEY_4 in Render environment variables."
     )
 
 print(f"[keys] Loaded {len(API_KEYS)} key(s)")
@@ -857,6 +863,21 @@ IMG_DECLINE = (
 )
 
 
+def _image_prompt_from_user(user_input: str) -> str:
+    prompt = re.sub(r'\s+', ' ', user_input or '').strip()
+    prompt = re.sub(r'^\s*/imagine\s*', '', prompt, flags=re.IGNORECASE)
+    prompt = re.sub(
+        r'^\s*(?:please\s+)?(?:generate|create|make|draw|paint|design|produce|render)\s+'
+        r'(?:me\s+)?(?:an?\s+)?(?:image|picture|photo|illustration|artwork|graphic|wallpaper|logo|'
+        r'poster|banner|sketch|portrait|thumbnail)\s*(?:of|for)?\s*',
+        '',
+        prompt,
+        flags=re.IGNORECASE,
+    ).strip()
+    prompt = prompt.strip(" \"'`")
+    return prompt or (user_input or '').strip()
+
+
 # ─────────────────────────────────────────────────────────────────────
 #  SYSTEM PROMPT
 # ─────────────────────────────────────────────────────────────────────
@@ -996,7 +1017,8 @@ def chat(req: ChatRequest):
     tl = user_input.lower().strip()
 
     if IMG_RE.search(user_input):
-        return {"reply": IMG_DECLINE, "thinking": "",
+        prompt = _image_prompt_from_user(user_input)
+        return {"reply": f"[[IMAGE: {prompt}]]", "thinking": "",
                 "searched": False, "sources": []}
 
     if tl in IDENTITY:
