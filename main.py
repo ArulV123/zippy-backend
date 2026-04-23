@@ -1,8 +1,7 @@
-
 from fastapi import FastAPI
 from fastapi.middleware.cors import CORSMiddleware
 from pydantic import BaseModel
-import Groq, RateLimitError, APIStatusError
+from groq import Groq, RateLimitError, APIStatusError
 import requests
 import os
 import re
@@ -36,14 +35,24 @@ def current_year() -> int:
 
 # ─────────────────────────────────────────────────────────────────────
 #  API KEY POOL
+#  Reads keys from environment variables:
+#    GROQ_API_KEY  → key slot 0  (your original key)
+#    GROQ_KEY_1    → key slot 1
+#    GROQ_KEY_2    → key slot 2
+#
+#  Logic:
+#  • Try every model on key 0 first
+#  • If all models on key 0 are rate-limited → silently move to key 1
+#  • If all models on key 1 are rate-limited → silently move to key 2
+#  • If all keys exhausted → wait for soonest recovery or return friendly error
 # ─────────────────────────────────────────────────────────────────────
+
 def _load_keys() -> list[str]:
+    """Load all API keys from environment, deduplicated, no blanks."""
     raw = [
         os.environ.get("GROQ_API_KEY", ""),
         os.environ.get("GROQ_KEY_1",   ""),
         os.environ.get("GROQ_KEY_2",   ""),
-        os.environ.get("GROQ_KEY_3",   ""),
-        os.environ.get("GROQ_KEY_4",   ""),
     ]
     seen = set()
     keys = []
@@ -58,11 +67,13 @@ API_KEYS: list[str] = _load_keys()
 
 if not API_KEYS:
     raise RuntimeError(
-        "No API keys found. Set GROQ_API_KEY, GROQ_KEY_1 … GROQ_KEY_4 "
+        "No API keys found. Set GROQ_API_KEY, GROQ_KEY_1, GROQ_KEY_2 "
         "in Render environment variables."
     )
 
 print(f"[keys] Loaded {len(API_KEYS)} key(s)")
+
+# One Groq client per key
 _clients: list[Groq] = [Groq(api_key=k) for k in API_KEYS]
 
 
@@ -77,17 +88,20 @@ CHAT_MODELS = [
     {"id": "llama3-8b-8192",          "name": "Model E"},
 ]
 
-# Fast small models only — thinking should be cheap and quick
 THINK_MODELS = [
     {"id": "llama-3.1-8b-instant",    "name": "Model B"},
     {"id": "gemma2-9b-it",            "name": "Model C"},
     {"id": "llama3-8b-8192",          "name": "Model E"},
+    {"id": "llama-3.3-70b-versatile", "name": "Model A"},
 ]
 
 
 # ─────────────────────────────────────────────────────────────────────
 #  COOLDOWN TRACKER
+#  Tracks when each (key_index, model_id) pair becomes available again.
 # ─────────────────────────────────────────────────────────────────────
+
+# cooldown[(key_idx, model_id)] = unix timestamp when available again
 cooldown: dict[tuple[int, str], float] = {}
 
 def _is_available(key_idx: int, mid: str) -> bool:
@@ -98,6 +112,7 @@ def _mark_limited(key_idx: int, mid: str, wait_sec: float):
     print(f"[rl] key{key_idx} / {mid} blocked {wait_sec:.0f}s")
 
 def _parse_wait(exc: Exception) -> float:
+    """Extract retry-after seconds from Groq rate limit error message."""
     try:
         msg = str(exc)
         m = re.search(r'(?:try again in|retry after)\s*([\d.]+)s', msg, re.IGNORECASE)
@@ -111,6 +126,7 @@ def _parse_wait(exc: Exception) -> float:
     return 62.0
 
 def _soonest_recovery(models: list[dict]) -> float:
+    """Seconds until any (key, model) pair becomes available. 0 if any is free now."""
     now = time.time()
     waits = []
     for ki in range(len(API_KEYS)):
@@ -127,7 +143,11 @@ def fmt_wait(s: float) -> str:
 
 # ─────────────────────────────────────────────────────────────────────
 #  CORE CALLER
+#  For each key (0 → 1 → 2), tries every model in order.
+#  Moves to the next key only when ALL models on the current key fail.
+#  Errors are logged internally; the caller never sees model/key names.
 # ─────────────────────────────────────────────────────────────────────
+
 def call_models(
     messages: list[dict],
     models: list[dict],
@@ -135,11 +155,16 @@ def call_models(
     temperature: float = 0.65,
     top_p: float = 0.9,
 ) -> tuple[str, str]:
+    """
+    Try every model on every key.
+    Returns (reply_text, internal_model_id).
+    Raises RuntimeError with QUOTA_EXCEEDED prefix if everything fails.
+    """
     for ki, client in enumerate(_clients):
         for m in models:
             mid = m["id"]
             if not _is_available(ki, mid):
-                continue
+                continue   # this (key, model) is cooling — skip silently
             try:
                 r = client.chat.completions.create(
                     model=mid,
@@ -154,14 +179,18 @@ def call_models(
             except RateLimitError as e:
                 wait = _parse_wait(e)
                 _mark_limited(ki, mid, wait)
+                # continue to next model on same key
 
             except APIStatusError as e:
                 _mark_limited(ki, mid, 15)
                 print(f"[api-err] key{ki} / {mid} → status {e.status_code}")
+                # continue to next model on same key
 
             except Exception as e:
                 print(f"[err] key{ki} / {mid} → {type(e).__name__}: {e}")
+                # continue to next model on same key
 
+    # Everything exhausted
     soonest = _soonest_recovery(models)
     raise RuntimeError(f"QUOTA_EXCEEDED|{fmt_wait(soonest)}")
 
@@ -174,6 +203,10 @@ def call_patient(
     top_p: float = 0.9,
     max_wait: float = 50.0,
 ) -> tuple[str, str]:
+    """
+    Same as call_models but if everything is rate-limited,
+    waits up to max_wait seconds for the soonest slot and retries once.
+    """
     try:
         return call_models(messages, models, max_tokens, temperature, top_p)
     except RuntimeError as e:
@@ -200,7 +233,7 @@ def _warm_up():
                 max_tokens=1,
             )
             print(f"[warmup] ✓ key{ki} ready")
-            return
+            return   # one successful warm-up is enough
         except Exception as e:
             print(f"[warmup] key{ki}: {e}")
 
@@ -219,78 +252,51 @@ app.add_middleware(
 
 
 # ─────────────────────────────────────────────────────────────────────
-#  UNIFIED THINKING PROMPT
-#  One cheap call decides: search? + intent (image/code/text/chat)
+#  THINKING PROMPT
 # ─────────────────────────────────────────────────────────────────────
 def make_think_prompt() -> str:
-    return f"""You are the decision engine for Zippy AI.
+    return f"""You are the search decision engine for Zippy AI.
 TODAY IS EXACTLY: {today_str()}
 CURRENT YEAR: {current_year()}
 
-Read the user message and output ONLY raw JSON:
+Read the user message and decide: does answering it need LIVE internet data?
+
+Output ONLY raw JSON:
 {{
   "needs_search": true or false,
-  "search_query": "short optimised query, empty string if false",
-  "intent": "image" or "code" or "text" or "chat",
-  "reasoning": "one short sentence"
+  "search_query": "short optimised query, empty if false",
+  "reasoning": "one sentence"
 }}
 
-──────────── needs_search ────────────
-TRUE for:
-• Any live price: crypto, stocks, gold, silver, platinum, oil, petrol, diesel, fuel
-• Currency exchange rates (USD/INR, dollar, forex, conversion)
+SEARCH NEEDED (needs_search: true):
+• Any price: crypto, stocks, gold, silver, platinum, oil
+• Petrol / diesel / fuel prices anywhere
+• Currency exchange rates (USD/INR, dollar, forex)
 • Weather or forecast for any city
 • Sports scores, match results, tournament winners
-• Recent or breaking news, current events, elections, government changes
+• Recent or breaking news, current events
+• Elections, government changes, political events
 • "Who is the current X" — any active role
 • Software releases: "latest version", "new update"
-• Questions with: today / now / currently / latest / this week / 2024 / 2025 / 2026
-• Any ongoing situation from 2023–{current_year()}
+• Questions mentioning today / now / currently / latest / this week / 2024 / 2025 / 2026
+• Any ongoing situation or event from 2023–{current_year()}
 
-FALSE for:
-• Greetings, jokes, small talk, thanks
-• Pure coding: syntax, algorithms, writing code, webpages, UIs
-• Math, science theory, history before 2023
-• Creative writing, definitions, grammar, translation
-• Image generation requests ("draw", "generate image", "create picture")
-• Image capability questions ("can you draw?")
+NO SEARCH NEEDED (needs_search: false):
+• Normal conversation: greetings, jokes, small talk
+• Pure coding: syntax, algorithms, how to write code
+• Math problems and calculations
+• Science theory (concepts that don't change)
+• History before 2023
+• Creative writing: poems, essays, stories
+• Definitions of stable concepts
+• Grammar and translation
 
-When in doubt → search (true).
+When in doubt → search.
 
-──────────── intent ────────────
-"image" → user explicitly asks for visual media:
-   draw, paint, generate image, create picture, make a poster, wallpaper,
-   illustration, logo, banner, sketch, portrait, thumbnail, artwork, photo of X.
-   Must have a clear visual SUBJECT (not just a capability question).
-   Examples: "draw a cat", "generate an image of a sunset", "make a poster of mars".
-
-"code" → user asks for code, website, webpage, UI, frontend, HTML, CSS,
-   JavaScript, Python, React, component, layout, styling, dashboard, landing page,
-   script, program, function, algorithm implementation, regex, SQL query.
-   Examples: "make a colorful webpage", "build a landing page", "write python to X",
-   "css for a dark button", "react component for login".
-
-"text" → user wants a written answer:
-   explanation, definition, essay, story, summary, tutorial, translation,
-   math problem, factual Q&A, live-data question (prices/weather/news).
-   Examples: "explain recursion", "stock price of HDFC", "who won the match".
-
-"chat" → greetings, thanks, small talk, identity questions, jokes.
-   Examples: "hi", "thanks", "who are you", "good night".
-
-CRITICAL DISAMBIGUATION:
-• "webpage with colors" / "colorful website" / "beautiful UI"  → intent=code (NOT image)
-• "can you draw?" / "do you generate images?"                  → intent=chat
-• "draw a red car" / "image of a cat"                          → intent=image
-• "code for a login page"                                      → intent=code
-• "explain how login works"                                    → intent=text
-• "stock price of X" / "weather in Y"                          → intent=text, needs_search=true
-
-Output ONLY the JSON, nothing else:"""
+JSON ONLY:"""
 
 
-def run_thinking(user_input: str, timeout: float = 18.0) -> dict:
-    """Single cheap call → returns {needs_search, search_query, intent, reasoning}."""
+def run_thinking(user_input: str, timeout: float = 9.0) -> dict:
     box: list[dict] = []
 
     def _call():
@@ -298,22 +304,14 @@ def run_thinking(user_input: str, timeout: float = 18.0) -> dict:
             raw, _ = call_models(
                 [{"role": "system", "content": make_think_prompt()},
                  {"role": "user",   "content": user_input}],
-                THINK_MODELS, max_tokens=140, temperature=0.0, top_p=1.0,
+                THINK_MODELS, max_tokens=130, temperature=0.0, top_p=1.0,
             )
             raw = re.sub(r"```(?:json)?|```", "", raw).strip()
             match = re.search(r'\{.*?\}', raw, re.DOTALL)
             if match:
                 p = json.loads(match.group(0))
-                # Validate shape
-                if not isinstance(p.get("needs_search"), bool):
-                    return
-                intent = str(p.get("intent", "text")).lower().strip()
-                if intent not in ("image", "code", "text", "chat"):
-                    intent = "text"
-                p["intent"] = intent
-                p["search_query"] = str(p.get("search_query", "") or "").strip()
-                p["reasoning"]    = str(p.get("reasoning", "") or "").strip()
-                box.append(p)
+                if isinstance(p.get("needs_search"), bool):
+                    box.append(p)
         except Exception as e:
             print(f"[think] err: {e}")
 
@@ -323,21 +321,14 @@ def run_thinking(user_input: str, timeout: float = 18.0) -> dict:
 
     if box:
         r = box[0]
-        print(f"[think] intent={r['intent']} search={r['needs_search']} q='{r.get('search_query','')}'")
+        print(f"[think] search={r['needs_search']} q='{r.get('search_query','')}'")
         return r
-
-    # Fallback when thinking genuinely timed out — be permissive, not restrictive
-    print("[think] timed out — permissive fallback")
-    return {
-        "needs_search": False,
-        "search_query": "",
-        "intent":       "text",
-        "reasoning":    "Decision engine timed out; defaulting to plain text reply.",
-    }
+    print("[think] timed out — default: no search")
+    return {"needs_search": False, "search_query": "", "reasoning": "Timed out."}
 
 
 # ─────────────────────────────────────────────────────────────────────
-#  SEARCH SOURCES  (UNCHANGED)
+#  SEARCH SOURCES
 # ─────────────────────────────────────────────────────────────────────
 BASE_H = {
     "User-Agent": "Mozilla/5.0 (compatible; ZippyAI/2.0)",
@@ -366,6 +357,7 @@ def _f(val, pre="$", dp=2) -> str:
     return f"{pre}{val:,.{dp}f}" if val >= 0.01 else f"{pre}{val:.6f}"
 
 
+# ── CRYPTO ────────────────────────────────────────────────────────────
 CRYPTO_CG = {
     "bitcoin":"bitcoin","btc":"bitcoin","ethereum":"ethereum","eth":"ethereum",
     "dogecoin":"dogecoin","doge":"dogecoin","solana":"solana","sol":"solana",
@@ -402,7 +394,7 @@ def search_crypto(q: str) -> dict | None:
             lines = []
             for cid, info in data.items():
                 usd  = info.get("usd"); inr = info.get("inr")
-                chg  = info.get("usd_24hr_change")
+                chg  = info.get("usd_24h_change")
                 mcap = info.get("usd_market_cap"); vol = info.get("usd_24h_vol")
                 lines.append(
                     f"• {cid.capitalize()} — {now_utc_str()}\n"
@@ -441,6 +433,7 @@ def search_crypto(q: str) -> dict | None:
     return None
 
 
+# ── METALS ────────────────────────────────────────────────────────────
 def search_metals(q: str) -> dict | None:
     lo = q.lower()
     metals = [m for m in ["gold", "silver", "platinum", "palladium"] if m in lo]
@@ -477,6 +470,7 @@ def search_metals(q: str) -> dict | None:
         print(f"[metals] {e}"); return None
 
 
+# ── FOREX ─────────────────────────────────────────────────────────────
 FX_NAMES = {
     "dollar": "USD", "usd": "USD", "us dollar": "USD", "american dollar": "USD",
     "rupee": "INR", "inr": "INR", "indian rupee": "INR",
@@ -528,6 +522,7 @@ def search_forex(q: str) -> dict | None:
         print(f"[forex] {e}"); return None
 
 
+# ── PETROL / DIESEL ───────────────────────────────────────────────────
 FUEL_WORDS = {"petrol", "diesel", "fuel", "lpg", "cng", "gas price", "gasoline"}
 
 def search_fuel(q: str) -> dict | None:
@@ -549,6 +544,7 @@ def search_fuel(q: str) -> dict | None:
             "url": "https://iocl.com", "content": content}
 
 
+# ── WEATHER ───────────────────────────────────────────────────────────
 def _city(q: str) -> str | None:
     lo = q.lower()
     if not any(w in lo for w in {"weather", "temperature", "forecast", "humidity",
@@ -603,6 +599,7 @@ def search_weather(q: str) -> dict | None:
         print(f"[weather] {e}"); return None
 
 
+# ── NEWS ──────────────────────────────────────────────────────────────
 NEWS_MAX_AGE_DAYS = 7
 
 def _article_age_days(pub_date_str: str) -> float:
@@ -711,6 +708,7 @@ def search_news(q: str, max_results: int = 6) -> dict | None:
     }
 
 
+# ── WIKIPEDIA ─────────────────────────────────────────────────────────
 def search_wikipedia(q: str) -> dict | None:
     try:
         r = requests.get("https://en.wikipedia.org/w/api.php",
@@ -744,6 +742,7 @@ def search_wikipedia(q: str) -> dict | None:
     return None
 
 
+# ── REST COUNTRIES ────────────────────────────────────────────────────
 def search_country(q: str) -> dict | None:
     if not any(w in q.lower() for w in
                {"capital", "population", "currency", "language",
@@ -785,6 +784,7 @@ def search_country(q: str) -> dict | None:
         print(f"[country] {e}"); return None
 
 
+# ── MASTER SEARCH ─────────────────────────────────────────────────────
 def run_search(q: str) -> list[dict]:
     results: list[dict] = []; seen: set[str] = set()
 
@@ -838,71 +838,45 @@ def build_context(q: str, results: list[dict]) -> str:
 
 
 # ─────────────────────────────────────────────────────────────────────
-#  SYSTEM PROMPT  (intent-aware)
+#  IMAGE DETECTION
 # ─────────────────────────────────────────────────────────────────────
-def make_system(ctx: str = "", intent: str = "text") -> str:
+IMG_RE = re.compile(
+    r'\b(generate|create|make|draw|paint|design|produce|render)\b.{0,25}'
+    r'\b(image|picture|photo|illustration|artwork|graphic|wallpaper|logo|'
+    r'poster|banner|sketch|portrait|thumbnail)\b|^/imagine\b',
+    re.IGNORECASE)
+
+IMG_DECLINE = (
+    "I'm text-only — I can't generate images. 🙅\n\n"
+    "Try these free tools:\n"
+    "• **[Adobe Firefly](https://firefly.adobe.com)** — free, high quality\n"
+    "• **[Microsoft Designer](https://designer.microsoft.com)** — free with account\n"
+    "• **[Ideogram](https://ideogram.ai)** — great for text in images\n"
+    "• **[Craiyon](https://www.craiyon.com)** — free, no account needed\n\n"
+    "Want me to write a prompt for any of these? ✍️"
+)
+
+
+# ─────────────────────────────────────────────────────────────────────
+#  SYSTEM PROMPT
+# ─────────────────────────────────────────────────────────────────────
+def make_system(ctx: str = "") -> str:
     td = today_str(); tu = now_utc_str(); yr = current_year()
     date_block = (
         f"╔═══════════════════════════════════════╗\n"
         f"║  TODAY:  {td:<31}║\n"
         f"║  TIME:   {tu:<31}║\n"
         f"║  YEAR:   {yr:<31}║\n"
-        f"╚═══════════════════════════════════════════╝\n"
+        f"╚═══════════════════════════════════════╝\n"
         f"USE THIS DATE. NEVER assume any other year or date."
     )
-
-    # Intent-specific override injected by the decision engine
-    intent_block = ""
-    if intent == "image":
-        intent_block = """
-
-## HARD RULE — THIS IS AN IMAGE REQUEST
-- The decision engine classified this as an IMAGE request.
-- You MUST output exactly one [[IMAGE: detailed vivid prompt]] tag first.
-- After the tag, add at most ONE short sentence (under 8 words).
-- Do NOT output code, HTML, CSS, markdown, or explanations.
-"""
-    elif intent == "code":
-        intent_block = """
-
-## HARD RULE — THIS IS A CODE / UI / WEBPAGE REQUEST
-- The decision engine classified this as a CODE request (includes websites, UIs, layouts, styling).
-- NEVER output [[IMAGE: ...]] for this request.
-- Answer with actual code (HTML / CSS / JS / Python / etc.) or technical text only.
-- If the user asks for a colorful or heavy visual webpage, interpret that as CSS/layout, NOT as an image.
-"""
-    elif intent == "chat":
-        intent_block = """
-
-## HARD RULE — THIS IS SMALL TALK
-- The decision engine classified this as casual chat / greeting / identity.
-- Reply with ONE short friendly sentence.
-- NEVER output [[IMAGE: ...]] or code.
-"""
-    else:  # text
-        intent_block = """
-
-## HARD RULE — THIS IS A TEXT ANSWER REQUEST
-- The decision engine classified this as a plain written answer.
-- NEVER output [[IMAGE: ...]] for this request.
-- Reply with text (explanation, facts, bullets for news, etc.).
-"""
-
     base = f"""{date_block}
 
 You are Zippy, a smart AI assistant made by Arul Vethathiri.
 
 ## IDENTITY
+- Text-only AI. You cannot generate images.
 - Made by Arul Vethathiri, Class 11 student ({yr}).
-- You CAN generate images. When the intent is image, output exactly one tag:
-  [[IMAGE: detailed descriptive image prompt here]]
-
-## IMAGE GENERATION RULES
-- Only emit [[IMAGE: ...]] when the HARD RULE above says this is an image request.
-- Tag comes FIRST, then at most ONE short sentence (under 8 words).
-- Good: [[IMAGE: red sports car on mountain road at sunset]] Done! 🎨
-- Bad: "Sure! Here is your image. [[IMAGE: ...]] I hope you like it!"
-- NEVER say "I can't generate images". FORBIDDEN: "I'm unable to", "I cannot generate".
 
 ## TONE
 - Smart, calm, friendly — like a knowledgeable friend.
@@ -924,17 +898,10 @@ You are Zippy, a smart AI assistant made by Arul Vethathiri.
 10. Never repeat the question.
 11. End with exactly 1 relevant emoji.
 
-## CODE EXECUTION — STDOUT FORMATTING
-When writing Python or other interactive code that uses input():
-- ALWAYS add \\n at the START of each input prompt so each prompt appears
-  on its own line in non-interactive output.
-  ✅ input('\\nEnter your choice (1-4): ')
-  ❌ input('Enter your choice (1-4): ')
-
 ## PETROL / DIESEL PRICES
 No real-time API exists for Indian fuel prices.
 Tell the user the typical range and direct them to iocl.com or hpcl.com.
-NEVER guess or invent a specific per-litre price.{intent_block}
+NEVER guess or invent a specific per-litre price.
 """
     if not ctx:
         return base
@@ -960,16 +927,16 @@ NEVER guess or invent a specific per-litre price.{intent_block}
 #  STATIC REPLIES
 # ─────────────────────────────────────────────────────────────────────
 IDENTITY = {
-    "who are you":       "I'm Zippy, an AI assistant made by Arul Vethathiri! 🤖",
-    "what are you":      "I'm Zippy — an AI made by Arul Vethathiri. 🤖",
+    "who are you":       "I'm Zippy, a text-based AI made by Arul Vethathiri! 🤖",
+    "what are you":      "I'm Zippy — a text-only AI made by Arul Vethathiri. 🤖",
     "who made you":      "Arul Vethathiri, a Class 11 student. 👨‍💻",
     "who created you":   "I was created by Arul Vethathiri. 👨‍💻",
     "who built you":     "Built by Arul Vethathiri. 👨‍💻",
     "what is your name": "I'm Zippy! 😊",
     "what can you do": (
         "I can answer questions, help with code, explain concepts, do maths, "
-        "write content, generate images, and search the web for live prices, "
-        "weather, and news. 💬"
+        "write content, and search the web for live prices, weather, and news. "
+        "I can't generate images. 💬"
     ),
     "are you an ai":  "Yes — Zippy AI, made by Arul Vethathiri. 🤖",
     "are you human":  "Nope, I'm Zippy — an AI, but a capable one! 😄",
@@ -1027,19 +994,21 @@ def chat(req: ChatRequest):
                 "thinking": "", "searched": False, "sources": []}
 
     tl = user_input.lower().strip()
-    tl_clean = re.sub(r'^\[System:.*?\]\s*', '', tl, flags=re.DOTALL).strip()
 
-    if tl_clean in IDENTITY:
-        return {"reply": IDENTITY[tl_clean], "thinking": "",
-                "searched": False, "sources": []}
-    if tl_clean in SOCIAL:
-        return {"reply": SOCIAL[tl_clean], "thinking": "",
+    if IMG_RE.search(user_input):
+        return {"reply": IMG_DECLINE, "thinking": "",
                 "searched": False, "sources": []}
 
-    # Single AI decision call: search? + intent
+    if tl in IDENTITY:
+        return {"reply": IDENTITY[tl], "thinking": "",
+                "searched": False, "sources": []}
+    if tl in SOCIAL:
+        return {"reply": SOCIAL[tl], "thinking": "",
+                "searched": False, "sources": []}
+
+    # Decide whether to search
     think        = run_thinking(user_input)
     needs_search = think.get("needs_search", False)
-    intent       = think.get("intent", "text")
     sq           = (think.get("search_query") or "").strip() or user_input
     reasoning    = think.get("reasoning", "")
 
@@ -1052,8 +1021,8 @@ def chat(req: ChatRequest):
             sources = [{"title": r["title"], "url": r["url"], "source": r["source"]}
                        for r in results]
 
-    # Build messages with intent-aware system prompt
-    system = make_system(ctx, intent)
+    # Build messages
+    system = make_system(ctx)
     msgs   = [{"role": "system", "content": system}]
 
     for h in req.history[-20:]:
@@ -1076,6 +1045,7 @@ def chat(req: ChatRequest):
                 "searched": found, "sources": sources}
 
     except RuntimeError as exc:
+        # Extract wait time from error — never expose internal names
         parts    = str(exc).split("|", 1)
         wait_str = parts[1].strip() if len(parts) == 2 else "a few minutes"
         return {
