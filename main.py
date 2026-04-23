@@ -847,7 +847,13 @@ IMG_RE = re.compile(
     re.IGNORECASE)
 
 IMG_DECLINE = (
-    "Use [[IMAGE: ...]] for image requests so the front-end generator can run it. 🎨"
+    "I'm text-only — I can't generate images. 🙅\n\n"
+    "Try these free tools:\n"
+    "• **[Adobe Firefly](https://firefly.adobe.com)** — free, high quality\n"
+    "• **[Microsoft Designer](https://designer.microsoft.com)** — free with account\n"
+    "• **[Ideogram](https://ideogram.ai)** — great for text in images\n"
+    "• **[Craiyon](https://www.craiyon.com)** — free, no account needed\n\n"
+    "Want me to write a prompt for any of these? ✍️"
 )
 
 
@@ -869,7 +875,7 @@ def make_system(ctx: str = "") -> str:
 You are Zippy, a smart AI assistant made by Arul Vethathiri.
 
 ## IDENTITY
-- For image requests, return a compact tag exactly like [[IMAGE: detailed prompt]] so the front-end image generator can handle it.
+- Text-only AI. You cannot generate images.
 - Made by Arul Vethathiri, Class 11 student ({yr}).
 
 ## TONE
@@ -930,7 +936,7 @@ IDENTITY = {
     "what can you do": (
         "I can answer questions, help with code, explain concepts, do maths, "
         "write content, and search the web for live prices, weather, and news. "
-        "For images, I can produce an image prompt tag. 💬"
+        "I can't generate images. 💬"
     ),
     "are you an ai":  "Yes — Zippy AI, made by Arul Vethathiri. 🤖",
     "are you human":  "Nope, I'm Zippy — an AI, but a capable one! 😄",
@@ -988,10 +994,9 @@ def chat(req: ChatRequest):
                 "thinking": "", "searched": False, "sources": []}
 
     tl = user_input.lower().strip()
-    is_title_request = tl.startswith('3-6 word title')
 
-    if IMG_RE.search(user_input) and not is_title_request:
-        return {"reply": f"[[IMAGE: {user_input}]]", "thinking": "",
+    if IMG_RE.search(user_input):
+        return {"reply": IMG_DECLINE, "thinking": "",
                 "searched": False, "sources": []}
 
     if tl in IDENTITY:
