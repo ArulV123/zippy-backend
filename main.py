@@ -81,18 +81,13 @@ _clients: list[Groq] = [Groq(api_key=k) for k in API_KEYS]
 #  MODELS
 # ─────────────────────────────────────────────────────────────────────
 CHAT_MODELS = [
-    {"id": "llama-3.3-70b-versatile", "name": "Model A"},
-    {"id": "llama-3.1-8b-instant",    "name": "Model B"},
-    {"id": "gemma2-9b-it",            "name": "Model C"},
-    {"id": "llama3-70b-8192",         "name": "Model D"},
-    {"id": "llama3-8b-8192",          "name": "Model E"},
+    {"id": "openai/gpt-oss-120b",   "name": "GPT OSS 120B"},
+    {"id": "qwen/qwen3.6-27b",      "name": "Qwen 3.6 27B"},
 ]
 
 THINK_MODELS = [
-    {"id": "llama-3.1-8b-instant",    "name": "Model B"},
-    {"id": "gemma2-9b-it",            "name": "Model C"},
-    {"id": "llama3-8b-8192",          "name": "Model E"},
-    {"id": "llama-3.3-70b-versatile", "name": "Model A"},
+    {"id": "openai/gpt-oss-120b",   "name": "GPT OSS 120B"},
+    {"id": "qwen/qwen3.6-27b",      "name": "Qwen 3.6 27B"},
 ]
 
 
@@ -228,7 +223,7 @@ def _warm_up():
     for ki, client in enumerate(_clients):
         try:
             client.chat.completions.create(
-                model="llama-3.1-8b-instant",
+                model="qwen/qwen3.6-27b",
                 messages=[{"role": "user", "content": "hi"}],
                 max_tokens=1,
             )
